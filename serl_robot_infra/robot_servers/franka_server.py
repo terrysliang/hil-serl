@@ -21,20 +21,22 @@ flags.DEFINE_string(
     "robot_ip", "172.16.0.2", "IP address of the franka robot's controller box"
 )
 flags.DEFINE_string(
-    "gripper_ip", "192.168.1.114", "IP address of the robotiq gripper if being used"
+    "gripper_ip", "/dev/ttyUSB1", "IP address of the robotiq gripper if being used"
 )
 flags.DEFINE_string(
-    "gripper_type", "Robotiq", "Type of gripper to use: Robotiq, Franka, or None"
+    "gripper_type", "DH", "Type of gripper to use: Robotiq, Franka, or None"
 )
 flags.DEFINE_list(
     "reset_joint_target",
-    [0, 0, 0, -1.9, -0, 2, 0],
+    [1.5959619886,0.1452558658,-0.2614405266,-2.0465805071,0.0455929640,2.1850543402,1.3107662306],
     "Target joint angles for the robot to reset to",
 )
 flags.DEFINE_string("flask_url", 
     "127.0.0.1",
     "URL for the flask server to run on."
 )
+flags.DEFINE_string("flask_port", "5000", "Port for the flask server to run on.")
+
 flags.DEFINE_string("ros_port", "11311", "Port for the ROS master to run on.")
 
 
@@ -46,6 +48,8 @@ class FrankaServer:
         self.robot_ip = robot_ip
         self.ros_pkg_name = ros_pkg_name
         self.reset_joint_target = reset_joint_target
+        # print("RESET JOINT TARGET", self.reset_joint_target)
+        rospy.set_param("/target_joint_positions", self.reset_joint_target)
         self.gripper_type = gripper_type
 
         self.eepub = rospy.Publisher(
@@ -175,7 +179,6 @@ class FrankaServer:
         jacobian = np.array(list(msg.zero_jacobian)).reshape((6, 7), order="F")
         self.jacobian = jacobian
 
-
 ###############################################################################
 
 
@@ -200,8 +203,10 @@ def main(_):
 
     if GRIPPER_TYPE == "Robotiq":
         from robot_servers.robotiq_gripper_server import RobotiqGripperServer
-
         gripper_server = RobotiqGripperServer(gripper_ip=GRIPPER_IP)
+    elif GRIPPER_TYPE == "DH":
+        from robot_servers.dh_gripper_server import DHGripperServer
+        gripper_server = DHGripperServer(gripper_port=GRIPPER_IP)
     elif GRIPPER_TYPE == "Franka":
         from robot_servers.franka_gripper_server import FrankaGripperServer
 
@@ -292,6 +297,15 @@ def main(_):
     @webapp.route("/get_gripper", methods=["POST"])
     def get_gripper():
         return jsonify({"gripper": gripper_server.gripper_pos})
+    
+
+    # Route for getting gripper state
+    @webapp.route("/get_gripper_state", methods=["POST"])
+    def get_gripper_state():
+        if GRIPPER_TYPE == "DH":
+            return jsonify({"gripper_state": gripper_server.gripper_state})
+        else:
+            return jsonify({"gripper_state": 0})
 
     # Route for Running Joint Reset
     @webapp.route("/jointreset", methods=["POST"])
@@ -321,6 +335,18 @@ def main(_):
         gripper_server.open()
         return "Opened"
 
+    @webapp.route("/right_grasp", methods=["POST"])
+    def right_grasp():
+        gripper_server.right_grasp()
+        return "right_grasp"
+    
+     # Route for Opening the Gripper
+    @webapp.route("/grasp", methods=["POST"])
+    def grasp():
+        print("grasp")
+        gripper_server.grasp()
+        return "Grasped"
+
     # Route for Closing the Gripper
     @webapp.route("/close_gripper", methods=["POST"])
     def close():
@@ -343,7 +369,7 @@ def main(_):
         print(f"move gripper to {pos}")
         gripper_server.move(pos)
         return "Moved Gripper"
-
+    
     # Route for Clearing Errors (Communcation constraints, etc.)
     @webapp.route("/clearerr", methods=["POST"])
     def clear():
@@ -373,14 +399,13 @@ def main(_):
                 "gripper_pos": gripper_server.gripper_pos,
             }
         )
-
     # Route for updating compliance parameters
     @webapp.route("/update_param", methods=["POST"])
     def update_param():
         reconf_client.update_configuration(request.json)
         return "Updated compliance parameters"
 
-    webapp.run(host=FLAGS.flask_url)
+    webapp.run(host=FLAGS.flask_url, port=FLAGS.flask_port)
 
 
 if __name__ == "__main__":

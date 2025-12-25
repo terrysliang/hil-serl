@@ -28,12 +28,12 @@ class DHGripperServer(GripperServer):
 
     def open(self):
         self.gripper.set_vel(1000)
-        self.gripper.set_pos(1000)
+        self.gripper.set_pos(600)
 
     def close(self):
         self.gripper.set_force(40)
         self.gripper.set_vel(1000)
-        self.gripper.set_pos(0)
+        self.gripper.set_pos(450)
 
     def move(self, position): # 0~1000: 0~100%
         self.gripper.set_force(40)
@@ -54,9 +54,12 @@ if __name__ == "__main__":
     # time.sleep(2)
     # gripper_server.close()
     # time.sleep(2)
-    gripper_server.move(450)
     gripper_server.move(600)
-    time.sleep(2)
+
+    time.sleep(10)
+    gripper_server.move(450)
+
+
     # gripper_server.move(500)
     # time.sleep(2)
     # gripper_server.close_slow()

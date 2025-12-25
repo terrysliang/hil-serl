@@ -32,7 +32,7 @@ class ImageDisplayer(threading.Thread):
                 break
 
             frame = np.concatenate(
-                [cv2.resize(v, (128, 128)) for k, v in img_array.items() if "full" not in k], axis=1
+                [cv2.resize(v, (512, 512)) for k, v in img_array.items() if "full" not in k], axis=1
             )
 
             cv2.imshow(self.name, frame)

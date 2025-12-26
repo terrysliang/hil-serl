@@ -2,8 +2,11 @@
 **/__pycache__/
 *.pyc
 *ckpt/
+**/classifier_ckpt/
 classifier_data/
+**/classifier_data/
 demo_data/
+**/demo_data/
 log_pic/
 *st_run*/
 *.zip

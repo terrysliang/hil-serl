@@ -1,0 +1,8 @@
+{
+    "cmake.ignoreCMakeListsMissing": true,
+    "workbench.tree.indent": 17,
+    "editor.fontSize": 17
+    "http.proxySupport": "override",
+    "http.proxy": "http://127.0.0.1:7897",
+    "http.noProxy": "localhost,127.0.0.1,::1",
+}

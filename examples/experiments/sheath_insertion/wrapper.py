@@ -87,9 +87,9 @@ class SheathEnv(FrankaEnv):
         self.interpolate_move(top_pose, timeout=1)
         time.sleep(0.5)
 
-        grasp_pose = top_pose.copy()
-        grasp_pose[2] -= 0.05
-        self.interpolate_move(grasp_pose, timeout=0.5)
+        # grasp_pose = top_pose.copy()
+        # grasp_pose[2] -= 0.05
+        # self.interpolate_move(grasp_pose, timeout=0.5)
 
         requests.post(self.url + "close_gripper_slow")
         self.last_gripper_act = time.time()

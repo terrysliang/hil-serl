@@ -28,7 +28,7 @@ class DHGripperServer(GripperServer):
 
     def open(self):
         self.gripper.set_vel(1000)
-        self.gripper.set_pos(600)
+        self.gripper.set_pos(500)
 
     def close(self):
         self.gripper.set_force(40)
@@ -43,7 +43,7 @@ class DHGripperServer(GripperServer):
     def close_slow(self):
         self.gripper.set_force(40)
         self.gripper.set_vel(50)
-        self.gripper.set_pos(0)
+        self.gripper.set_pos(450)
 
 
 

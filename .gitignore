@@ -1,0 +1,10 @@
+*.egg-info/
+**/__pycache__/
+*.pyc
+*ckpt/
+classifier_data/
+demo_data/
+log_pic/
+*st_run*/
+*.zip
+*.md

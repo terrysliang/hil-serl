@@ -15,6 +15,9 @@ from franka_msgs.srv import SetLoad
 from serl_franka_controllers.msg import ZeroJacobian
 import geometry_msgs.msg as geom_msg
 from dynamic_reconfigure.client import Client as ReconfClient
+import signal
+import sys
+import atexit
 
 FLAGS = flags.FLAGS
 flags.DEFINE_string(
@@ -228,6 +231,38 @@ def main(_):
     reconf_client = ReconfClient(
         "cartesian_impedance_controllerdynamic_reconfigure_compliance_param_node"
     )
+    cleanup_done = {"flag": False}
+
+    def cleanup():
+        if cleanup_done["flag"]:
+            return
+        cleanup_done["flag"] = True
+        try:
+            robot_server.stop_impedance()
+        except Exception as e:
+            print(f"Failed to stop impedance cleanly: {e}")
+        try:
+            if hasattr(robot_server, "joint_controller"):
+                robot_server.joint_controller.terminate()
+        except Exception as e:
+            print(f"Failed to terminate joint controller: {e}")
+        try:
+            roscore.terminate()
+        except Exception as e:
+            print(f"Failed to terminate roscore: {e}")
+        try:
+            roscore.wait(timeout=5)
+        except Exception:
+            pass
+
+    def handle_signal(signum, frame):
+        print(f"Received signal {signum}, shutting down cleanly...")
+        cleanup()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+    atexit.register(cleanup)
 
     rospy.wait_for_service('/franka_control/set_load')
     set_load_service = rospy.ServiceProxy('/franka_control/set_load', SetLoad)
@@ -405,7 +440,7 @@ def main(_):
         reconf_client.update_configuration(request.json)
         return "Updated compliance parameters"
 
-    webapp.run(host=FLAGS.flask_url, port=FLAGS.flask_port)
+    webapp.run(host=FLAGS.flask_url, port=FLAGS.flask_port, use_reloader=False)
 
 
 if __name__ == "__main__":

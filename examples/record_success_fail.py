@@ -15,16 +15,21 @@ flags.DEFINE_integer("successes_needed", 200, "Number of successful transistions
 
 
 success_key = False
+done_key = False
 def on_press(key):
     global success_key
+    global done_key
     try:
         if str(key) == 'Key.space':
-            success_key = True
+            success_key = not success_key
+        elif str(key) == 'Key.esc':  # end current episode
+            done_key = True
     except AttributeError:
         pass
 
 def main(_):
     global success_key
+    global done_key
     listener = keyboard.Listener(
         on_press=on_press)
     listener.start()
@@ -38,45 +43,57 @@ def main(_):
     success_needed = FLAGS.successes_needed
     pbar = tqdm(total=success_needed)
     
-    while len(successes) < success_needed:
-        actions = np.zeros(env.action_space.sample().shape) 
-        next_obs, rew, done, truncated, info = env.step(actions)
-        if "intervene_action" in info:
-            actions = info["intervene_action"]
+    try:
+        while len(successes) < success_needed:
+            actions = np.zeros(env.action_space.sample().shape) 
+            next_obs, rew, done, truncated, info = env.step(actions)
+            if "intervene_action" in info:
+                actions = info["intervene_action"]
 
-        transition = copy.deepcopy(
-            dict(
-                observations=obs,
-                actions=actions,
-                next_observations=next_obs,
-                rewards=rew,
-                masks=1.0 - done,
-                dones=done,
+            transition = copy.deepcopy(
+                dict(
+                    observations=obs,
+                    actions=actions,
+                    next_observations=next_obs,
+                    rewards=rew,
+                    masks=1.0 - done,
+                    dones=done,
+                )
             )
-        )
-        obs = next_obs
-        if success_key:
-            successes.append(transition)
-            pbar.update(1)
-            success_key = False
-        else:
-            failures.append(transition)
+            obs = next_obs
+            if success_key:
+                successes.append(transition)
+                pbar.update(1)
+            else:
+                failures.append(transition)
 
-        if done or truncated:
-            obs, _ = env.reset()
+            if done or truncated or done_key:
+                success_key = False
+                done_key = False
+                obs, _ = env.reset()
 
-    if not os.path.exists("./classifier_data"):
-        os.makedirs("./classifier_data")
-    uuid = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    file_name = f"./classifier_data/{FLAGS.exp_name}_{success_needed}_success_images_{uuid}.pkl"
-    with open(file_name, "wb") as f:
-        pkl.dump(successes, f)
-        print(f"saved {success_needed} successful transitions to {file_name}")
+        if not os.path.exists("./classifier_data"):
+            os.makedirs("./classifier_data")
+        uuid = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        file_name = f"./classifier_data/{FLAGS.exp_name}_{success_needed}_success_images_{uuid}.pkl"
+        with open(file_name, "wb") as f:
+            pkl.dump(successes, f)
+            print(f"saved {success_needed} successful transitions to {file_name}")
 
-    file_name = f"./classifier_data/{FLAGS.exp_name}_failure_images_{uuid}.pkl"
-    with open(file_name, "wb") as f:
-        pkl.dump(failures, f)
-        print(f"saved {len(failures)} failure transitions to {file_name}")
+        file_name = f"./classifier_data/{FLAGS.exp_name}_failure_images_{uuid}.pkl"
+        with open(file_name, "wb") as f:
+            pkl.dump(failures, f)
+            print(f"saved {len(failures)} failure transitions to {file_name}")
         
+    finally:
+        # Ensure background threads/processes shut down cleanly
+        try:
+            listener.stop()
+        except Exception:
+            pass
+        try:
+            env.close()
+        except Exception:
+            pass
 if __name__ == "__main__":
     app.run(main)

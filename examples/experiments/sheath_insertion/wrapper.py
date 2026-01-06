@@ -14,7 +14,7 @@ class SheathEnv(FrankaEnv):
         self.should_regrasp = False
 
         def on_press(key):
-            if str(key) == "Key.f1":
+            if str(key) == "Key.f2":
                 self.should_regrasp = True
 
         listener = keyboard.Listener(
@@ -80,12 +80,14 @@ class SheathEnv(FrankaEnv):
 
         input("Press enter to release gripper...")
         self._send_gripper_command(1.0)
+        time.sleep(1)
+        
         input("Place sheath in holder and press enter to grasp...")
-        top_pose = self.config.GRASP_POSE.copy()
-        top_pose[2] += 0.05
-        top_pose[0] += np.random.uniform(-0.005, 0.005)
-        self.interpolate_move(top_pose, timeout=1)
-        time.sleep(0.5)
+        # top_pose = self.config.GRASP_POSE.copy()
+        # top_pose[2] += 0.05
+        # top_pose[0] += np.random.uniform(-0.005, 0.005)
+        # self.interpolate_move(top_pose, timeout=1)
+        # time.sleep(0.5)
 
         # grasp_pose = top_pose.copy()
         # grasp_pose[2] -= 0.05
@@ -95,8 +97,6 @@ class SheathEnv(FrankaEnv):
         self.last_gripper_act = time.time()
         time.sleep(2)
 
-        self.interpolate_move(top_pose, timeout=0.5)
-        time.sleep(0.2)
 
         self.interpolate_move(self.config.RESET_POSE, timeout=1)
         time.sleep(0.5)

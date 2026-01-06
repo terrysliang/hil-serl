@@ -18,6 +18,7 @@ from dynamic_reconfigure.client import Client as ReconfClient
 import signal
 import sys
 import atexit
+import threading
 
 FLAGS = flags.FLAGS
 flags.DEFINE_string(
@@ -72,6 +73,8 @@ class FrankaServer:
         self.state_sub = rospy.Subscriber(
             "franka_state_controller/franka_states", FrankaState, self._set_currpos
         )
+
+        self._movej_lock = threading.Lock()
 
     def start_impedance(self):
         """Launches the impedance controller"""
@@ -152,6 +155,91 @@ class FrankaServer:
         # Restart impedece controller
         self.start_impedance()
         print("impedance STARTED")
+
+    def movej(self, target_q, motion_duration_s: float = 10.0, timeout_s: float = 30.0,
+            atol: float = 1e-2, rtol: float = 1e-2, poll_dt: float = 0.05):
+        """Move to a desired joint configuration (7 DoF, radians) using joint_position_controller.
+
+        Speed control is done via the ROS param:
+        /joint_position_controller/motion_duration   (seconds)
+
+        Notes:
+        - timeout_s only bounds waiting; it does not set the controller speed.
+        - motion_duration_s sets how long the controller takes to interpolate to the target.
+        """
+        with self._movej_lock:
+            q = np.asarray(target_q, dtype=np.float64).reshape(-1)
+            if q.size != 7:
+                raise ValueError(f"movej expects 7 joint values (rad), got {q.size}")
+
+            # Ensure we have a valid current joint state before waiting.
+            t_wait = time.time()
+            while not hasattr(self, "q"):
+                time.sleep(0.05)
+                if time.time() - t_wait > 3.0:
+                    break
+
+            # Stop impedance (if running) and clear errors.
+            try:
+                self.stop_impedance()
+                self.clear()
+            except Exception:
+                print("impedance Not Running")
+            time.sleep(0.2)
+            self.clear()
+
+            # If a previous joint controller process exists, kill it.
+            try:
+                if hasattr(self, "joint_controller"):
+                    self.joint_controller.terminate()
+                    time.sleep(0.1)
+            except Exception:
+                pass
+
+            # Set target joints + motion duration BEFORE launching joint.launch
+            rospy.set_param("/target_joint_positions", q.tolist())
+            try:
+                rospy.set_param("/joint_position_controller/motion_duration", float(motion_duration_s))
+            except Exception as e:
+                print(f"Failed to set motion_duration param: {e}")
+
+            self.joint_controller = subprocess.Popen(
+                [
+                    "roslaunch",
+                    self.ros_pkg_name,
+                    "joint.launch",
+                    "robot_ip:=" + self.robot_ip,
+                    f"load_gripper:={'true' if self.gripper_type == 'Franka' else 'false'}",
+                ],
+                stdout=subprocess.PIPE,
+            )
+            time.sleep(0.2)
+            self.clear()
+
+            # Wait until target joint angles are reached
+            t0 = time.time()
+            while True:
+                try:
+                    curr_q = np.asarray(self.q, dtype=np.float64).reshape(7)
+                    if np.allclose(q - curr_q, 0, atol=atol, rtol=rtol):
+                        break
+                except Exception:
+                    pass
+
+                if time.time() - t0 > float(timeout_s):
+                    print("movej TIMEOUT")
+                    break
+                time.sleep(float(poll_dt))
+
+            # Stop joint controller and restart impedance
+            try:
+                self.joint_controller.terminate()
+            except Exception:
+                pass
+            time.sleep(0.1)
+            self.clear()
+
+            self.start_impedance()
 
     def move(self, pose: list):
         """Moves to a pose: [x, y, z, qx, qy, qz, qw]"""
@@ -348,6 +436,26 @@ def main(_):
         robot_server.clear()
         robot_server.reset_joint()
         return "Reset Joint"
+
+    # Route for moveJ to a specific joint target (radians)
+    @webapp.route("/movej", methods=["POST"])
+    def movej():
+        data = request.json or {}
+        q = data.get("q", None)
+        if q is None:
+            q = data.get("arr", None)
+        if q is None:
+            return jsonify({"success": False, "error": "Expected JSON field 'q' or 'arr' with 7 joints"}), 400
+
+        motion_duration_s = data.get("motion_duration_s", data.get("duration_s", data.get("duration", 10.0)))
+        timeout_s = data.get("timeout_s", 30.0)
+
+        try:
+            robot_server.clear()
+            robot_server.movej(q, motion_duration_s=float(motion_duration_s), timeout_s=float(timeout_s))
+            return jsonify({"success": True})
+        except Exception as e:
+            return jsonify({"success": False, "error": str(e)}), 500
 
     # Route for Activating the Gripper
     @webapp.route("/activate_gripper", methods=["POST"])

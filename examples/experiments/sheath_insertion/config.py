@@ -127,9 +127,10 @@ class TrainConfig(DefaultTrainingConfig):
                 p = jax.nn.sigmoid(classifier(obs))
                 p_scalar = float(jnp.ravel(p)[-1])            # <-- scalar python float
 
-                jaw = float(obs["state"][-1, 6])    
-                print("classifier value: ", p_scalar)          # <-- last timestep, scalar float
-                return int((p_scalar > 0.85) and (jaw > 0.04))
+                jaw = float(obs["state"][-1, 6])
+                state_last = jnp.asarray(obs["state"])[-1]
+                print(f"p={p_scalar:.4f}, jaw={jaw:.4f}, reward={(p_scalar>0.85) and (jaw>0.025)}")
+                return int((p_scalar > 0.85) and (jaw > 0.022))
 
             env = MultiCameraBinaryRewardClassifierWrapper(env, reward_func)
         return env

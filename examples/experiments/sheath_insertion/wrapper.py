@@ -113,7 +113,7 @@ class SheathEnv(FrankaEnv):
             self.should_regrasp = False
 
         self._recover()
-        self.go_to_reset(joint_reset=False)
+        # self.go_to_reset(joint_reset=False)
         self._recover()
         self.curr_path_length = 0
 

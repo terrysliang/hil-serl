@@ -54,21 +54,11 @@ flags.DEFINE_string(
     "If empty, uses env.unwrapped.url.",
 )
 flags.DEFINE_float("script_hz", 10.0, "Hz for scripted moveL interpolation.")
-flags.DEFINE_float("script_default_timeout", 1.0, "Default seconds for moveL interpolation.")
+flags.DEFINE_float("script_default_duration", 5.0, "Default seconds for moveL interpolation.")
 
 flags.DEFINE_boolean("do_pickup", False, "Run pickup scripted routine before policy rollout.")
-flags.DEFINE_boolean("do_release", True, "Open gripper after the episode ends.")
-flags.DEFINE_boolean("do_joint_reset_after", True, "Call joint reset after each episode ends.")
-
-# Poses are passed as comma-separated floats.
-# - moveL accepts either 6D (x,y,z,roll,pitch,yaw) in radians or 7D (x,y,z,qx,qy,qz,qw).
-flags.DEFINE_string("pickup_pre_pose", "", "Optional 6D/7D pose string for pre-grasp.")
-flags.DEFINE_string("pickup_grasp_pose", "", "Optional 6D/7D pose string for grasp pose.")
-flags.DEFINE_string("pickup_lift_pose", "", "Optional 6D/7D pose string for lift/retreat pose.")
-
-flags.DEFINE_string("post_release_pose", "", "Optional 6D/7D pose to move to before opening gripper.")
-flags.DEFINE_string("post_safe_pose", "", "Optional 6D/7D pose to move to after opening gripper.")
-
+flags.DEFINE_boolean("do_release", False, "Open gripper after the episode ends.")
+flags.DEFINE_boolean("do_joint_reset_after", False, "Call joint reset after each episode ends.")
 
 # Keep consistent with the training/eval pattern: replicate across local devices.
 devices = jax.local_devices()
@@ -102,7 +92,6 @@ def _rpy_to_quat_xyz_w(rpy: np.ndarray) -> np.ndarray:
     qz = cr * cp * sy - sr * sp * cy
     return np.array([qx, qy, qz, qw], dtype=np.float64)
 
-
 def _pose6_or_7_to_pose7(p: np.ndarray) -> np.ndarray:
     p = np.asarray(p, dtype=np.float64).reshape(-1)
     if p.size == 7:
@@ -111,6 +100,44 @@ def _pose6_or_7_to_pose7(p: np.ndarray) -> np.ndarray:
     quat = _rpy_to_quat_xyz_w(p[3:])
     return np.concatenate([xyz, quat], axis=0)
 
+def quat_angle(q1, q2):
+    # q = [x,y,z,w]
+    q1 = np.asarray(q1, float); q2 = np.asarray(q2, float)
+    q1 = q1 / (np.linalg.norm(q1) + 1e-12)
+    q2 = q2 / (np.linalg.norm(q2) + 1e-12)
+    d = abs(float(np.dot(q1, q2)))
+    d = max(-1.0, min(1.0, d))
+    return 2.0 * np.arccos(d)  # rad
+
+def wait_until_pose(robot, goal_pose7, *,
+                    pos_tol=0.0005,
+                    ori_tol_deg=0.5,
+                    vel_tol=0.05,           # rad/s (optional)
+                    timeout_s=10.0,
+                    poll_dt=0.02):
+    goal_pose7 = np.asarray(goal_pose7, float).reshape(7)
+    ori_tol = np.deg2rad(ori_tol_deg)
+
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        st = robot.get_state()
+        curr = np.asarray(st["pose"], float).reshape(7)
+
+        pos_err = np.linalg.norm(curr[:3] - goal_pose7[:3])
+        ori_err = quat_angle(curr[3:], goal_pose7[3:])
+
+        ok = (pos_err < pos_tol) and (ori_err < ori_tol)
+
+        # If dq is available, also require "settled" velocity
+        if ok and ("dq" in st):
+            dq = np.asarray(st["dq"], float).reshape(-1)
+            ok = ok and (np.max(np.abs(dq)) < vel_tol)
+
+        if ok:
+            return True
+
+        time.sleep(poll_dt)
+    return False
 
 @dataclass
 class FlaskRobotClient:
@@ -141,20 +168,24 @@ class FlaskRobotClient:
     def gripper_open(self):
         self._post("open_gripper")
 
+    def RGI_open(self):
+        self._post("open_rgi")
+
     def gripper_close(self):
         self._post("close_gripper")
 
     def joint_reset(self):
         self._post("jointreset")
 
-    def moveL(self, goal_pose: np.ndarray, timeout: Optional[float] = None):
+    def moveL(self, goal_pose, duration=1.0, hz=10.0,
+          pos_tol=0.0005, ori_tol_deg=0.5, settle_timeout_s=20.0):
         """Linear-interp Cartesian motion by repeatedly calling /pose at hz.
 
         goal_pose: (6,) xyz+rpy(rad) OR (7,) xyz+quat(xyzw)
         """
-        timeout = float(timeout) if timeout is not None else 1.0
+        duration = float(duration) if duration is not None else 1.0
         hz = float(self.hz) if self.hz > 0 else 10.0
-        steps = max(1, int(round(timeout * hz)))
+        steps = max(1, int(round(duration * hz)))
 
         st = self.get_state()
         curr = np.asarray(st["pose"], dtype=np.float64).reshape(7)
@@ -166,65 +197,81 @@ class FlaskRobotClient:
             self.send_pose7(p)
             time.sleep(1.0 / hz)
 
-    
-def moveJ(self, q: Optional[Sequence[float]] = None, timeout: Optional[float] = None):
-    """Joint-space move.
+        ok = wait_until_pose(self, goal_pose,
+                         pos_tol=pos_tol, ori_tol_deg=ori_tol_deg,
+                         timeout_s=settle_timeout_s)
+        if not ok:
+            print("[moveL] warning: timeout waiting for pose convergence")
 
-    - If q is None: calls /jointreset (built-in in your server).
-    - If q is provided: calls /movej with {"q": [7 joints], "timeout_s": ...}.
+    def moveJ(self, q: Optional[Sequence[float]] = None, timeout: Optional[float] = None):
+        """Joint-space move.
 
-    Requires the Flask server to expose POST /movej.
-    """
-    if q is None:
-        self.joint_reset()
-        time.sleep(0.5)
-        return
+        - If q is None: calls /jointreset (built-in in your server).
+        - If q is provided: calls /movej with {"q": [7 joints], "timeout_s": ...}.
 
-    q_list = np.asarray(q, dtype=np.float64).reshape(-1).tolist()
-    if len(q_list) != 7:
-        raise ValueError(f"moveJ expects 7 joints (rad), got {len(q_list)}")
+        Requires the Flask server to expose POST /movej.
+        """
+        if q is None:
+            self.joint_reset()
+            time.sleep(0.5)
+            return
 
-    payload = {"q": q_list}
-    if timeout is not None:
-        payload["timeout_s"] = float(timeout)
+        q_list = np.asarray(q, dtype=np.float64).reshape(-1).tolist()
+        if len(q_list) != 7:
+            raise ValueError(f"moveJ expects 7 joints (rad), got {len(q_list)}")
 
-    out = self._post("movej", json=payload)
-    if not isinstance(out, dict):
-        raise RuntimeError(f"/movej returned non-JSON: {out}")
+        payload = {"q": q_list}
+        if timeout is not None:
+            payload["timeout_s"] = float(timeout)
 
-    if out.get("success") is True:
-        return
+        out = self._post("movej", json=payload)
+        if not isinstance(out, dict):
+            raise RuntimeError(f"/movej returned non-JSON: {out}")
 
-    raise RuntimeError(f"moveJ failed: {out}")
+        if out.get("success") is True:
+            return
+
+        raise RuntimeError(f"moveJ failed: {out}")
 
 def scripted_pickup(robot: FlaskRobotClient):
     """Example pickup routine (poses must be provided via flags)."""
-    pre = _parse_floats_csv(FLAGS.pickup_pre_pose)
-    grasp = _parse_floats_csv(FLAGS.pickup_grasp_pose)
-    lift = _parse_floats_csv(FLAGS.pickup_lift_pose)
-
-    if pre is None or grasp is None:
-        print_green("[script] pickup skipped (need --pickup_pre_pose and --pickup_grasp_pose).")
-        return
+    pick = np.array([0.5502254928632084,0.40315765836094797,0.23516137877127272,0.7225989404526042,0.6912205636900535,0.004304454004383691,0.0068099386563031435])
+    prepick = pick
+    prepick[2] += 0.1
+    pick_home = np.array([0.3892901479199218,0.50033702367876,0.346014485119595,0.7012299730869341,0.7127140801584075,0.01771506619668636,0.0011581097097977959])
+    episode_home = np.array([0.13514075836778805, 0.5500716440949072, 0.13716668456036641, np.pi, 0, 0])
+    episode_start = episode_home
+    episode_start[2] += 0.15
 
     print_green("[script] pickup: open gripper")
     robot.gripper_open()
-    time.sleep(0.2)
+    time.sleep(0.1)
 
-    print_green("[script] pickup: moveL pre-grasp")
-    robot.moveL(pre, timeout=FLAGS.script_default_timeout)
+    print_green("[script] pickup: moveL picking-home")
+    robot.moveL(pick_home, duration=8)
 
-    print_green("[script] pickup: moveL grasp")
-    robot.moveL(grasp, timeout=FLAGS.script_default_timeout)
+    print_green("[script] pickup: moveL prepick")
+    robot.moveL(prepick, duration=8)
+
+    print_green("[script] pickup: moveL pick")
+    robot.moveL(pick, duration=3)
 
     print_green("[script] pickup: close gripper")
     robot.gripper_close()
-    time.sleep(0.4)
+    time.sleep(0.2)
 
-    if lift is not None:
-        print_green("[script] pickup: moveL lift/retreat")
-        robot.moveL(lift, timeout=FLAGS.script_default_timeout)
+    print_green("[script] pickup: open RGI gripper")
+    robot.RGI_open()
+    time.sleep(0.2)
 
+    print_green("[script] pickup: moveL prepick")
+    robot.moveL(prepick, duration=3)
+
+    print_green("[script] pickup: moveL eposide_start")
+    robot.moveL(episode_start, duration=10)
+
+    print_green("[script] pickup: moveL eposide_home")
+    robot.moveL(episode_home, duration=3)
 
 def scripted_post_episode(robot: FlaskRobotClient):
     """Example post-episode routine: (optional) move -> open -> (optional) move -> joint reset."""
@@ -233,7 +280,7 @@ def scripted_post_episode(robot: FlaskRobotClient):
 
     if pre_release is not None:
         print_green("[script] post: moveL pre-release")
-        robot.moveL(pre_release, timeout=FLAGS.script_default_timeout)
+        robot.moveL(pre_release, timeout=FLAGS.script_default_duration)
 
     if FLAGS.do_release:
         print_green("[script] post: open gripper")
@@ -242,7 +289,7 @@ def scripted_post_episode(robot: FlaskRobotClient):
 
     if post_safe is not None:
         print_green("[script] post: moveL safe pose")
-        robot.moveL(post_safe, timeout=FLAGS.script_default_timeout)
+        robot.moveL(post_safe, timeout=FLAGS.script_default_duration)
 
     if FLAGS.do_joint_reset_after:
         print_green("[script] post: joint reset")
@@ -274,6 +321,7 @@ def evaluate(agent, env, rng, robot: FlaskRobotClient):
         # Scripted "setup" (pickup) BEFORE the policy loop.
         if FLAGS.do_pickup:
             scripted_pickup(robot)
+            break
             # ensure the env sees fresh state if it caches (FrankaEnv queries /getstate in step anyway)
 
         step_in_ep = 0

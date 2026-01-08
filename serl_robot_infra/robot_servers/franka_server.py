@@ -298,6 +298,7 @@ def main(_):
     elif GRIPPER_TYPE == "DH":
         from robot_servers.dh_gripper_server import DHGripperServer
         gripper_server = DHGripperServer(gripper_port=GRIPPER_IP)
+        RGI_gripper_server = DHGripperServer(gripper_port="/dev/ttyUSB2")
     elif GRIPPER_TYPE == "Franka":
         from robot_servers.franka_gripper_server import FrankaGripperServer
 
@@ -477,6 +478,12 @@ def main(_):
         print("open")
         gripper_server.open()
         return "Opened"
+    
+    @webapp.route("/open_rgi", methods=["POST"])
+    def open_rgi():
+        print("open rgi")
+        RGI_gripper_server.open()
+        return "RGI Opened"
 
     @webapp.route("/right_grasp", methods=["POST"])
     def right_grasp():

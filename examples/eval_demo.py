@@ -96,16 +96,56 @@ def quat_angle(q1, q2):
     d = max(-1.0, min(1.0, d))
     return 2.0 * np.arccos(d)  # rad
 
-def wait_for_file(path: str, poll_s: float = 0.05):
+def wait_for_file(path: str, poll_s: float = 0.05, remove_first: bool = True):
     p = Path(path)
     # don't accidentally auto-start due to a stale file
-    if p.exists():
+    if remove_first and p.exists():
         p.unlink()
     print(f"[eval] Ready. Waiting for: {path}", flush=True)
     while not p.exists():
         time.sleep(poll_s)
     print("[eval] Start signal received.", flush=True)
     
+
+def restore_agent_checkpoint(agent):
+    """Restore agent state from checkpoint on host (pre-load before handoff wait)."""
+    assert FLAGS.checkpoint_path is not None, "--checkpoint_path is required"
+    assert FLAGS.eval_checkpoint_step, "--eval_checkpoint_step must be > 0"
+    t0 = time.time()
+    print_green(f"[eval] restoring checkpoint (preload): {os.path.abspath(FLAGS.checkpoint_path)} step={FLAGS.eval_checkpoint_step}")
+    print_green(f"[eval] checkpoint restored in {time.time()-t0:.3f}s")
+    return agent
+
+
+def warmup_policy(agent, rng, obs_space):
+    """Trigger JAX compilation before we start moving the robot."""
+    t0 = time.time()
+    print_green("[eval] warming up policy (JIT compile)")
+    dummy_obs = obs_space.sample()
+
+    # Match the evaluation loop behavior (split rng, then call sample_actions).
+    rng, key = jax.random.split(rng)
+    actions = agent.sample_actions(
+        observations=jax.device_put(dummy_obs),
+        argmax=False,
+        seed=key,
+    )
+
+    # Block until compilation/execution completes.
+    try:
+        jax.tree_util.tree_map(
+            lambda x: x.block_until_ready() if hasattr(x, "block_until_ready") else x,
+            actions,
+        )
+    except Exception:
+        # Fallback: block on the first leaf if tree_map fails for any reason.
+        leaves, _ = jax.tree_util.tree_flatten(actions)
+        if leaves and hasattr(leaves[0], "block_until_ready"):
+            leaves[0].block_until_ready()
+
+    print_green(f"[eval] warmup finished in {time.time()-t0:.3f}s")
+    return rng
+
 @dataclass
 class FlaskRobotClient:
     server_url: str
@@ -194,13 +234,6 @@ def evaluate(agent, env, rng, robot: FlaskRobotClient):
     assert FLAGS.checkpoint_path is not None, "--checkpoint_path is required"
     assert FLAGS.eval_checkpoint_step, "--eval_checkpoint_step must be > 0"
     assert FLAGS.eval_n_trajs > 0, "--eval_n_trajs must be > 0"
-
-    ckpt = checkpoints.restore_checkpoint(
-        os.path.abspath(FLAGS.checkpoint_path),
-        agent.state,
-        step=FLAGS.eval_checkpoint_step,
-    )
-    agent = agent.replace(state=ckpt)
 
     success_counter = 0.0
     times = []
@@ -303,10 +336,20 @@ def main(_):
 
     robot = FlaskRobotClient(server_url=server_url, hz=hz)
     print_green(f"Flask server: {robot.server_url}")
+    # Clear any stale start signal file once at startup.
+    start_file = "/tmp/start_eval"
+    p = Path(start_file)
+    if p.exists():
+        p.unlink()
+
     print_green("stop impedance for host controller")
     robot.stop_imp()
 
-    wait_for_file("/tmp/start_eval")
+    # Preload checkpoint + JIT compile while the host controller is running.
+    agent = restore_agent_checkpoint(agent)
+    sampling_rng = warmup_policy(agent, sampling_rng, env.observation_space)
+
+    wait_for_file(start_file, remove_first=False)
     
     print_green("start impedance and evaluate")
     robot.start_imp()

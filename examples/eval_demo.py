@@ -1,22 +1,9 @@
 #!/usr/bin/env python3
-"""Actor-only evaluation script with *scriptable* robot/gripper utilities.
-
-This is a companion to eval_record_minimal.py:
-- eval_record_minimal.py: evaluate + RECORD full rollouts to pkl.
-- this script: evaluate WITHOUT recording, but lets you run scripted motions
-  (pickup, release, joint reset, etc.) via small reusable util functions.
-
-Why this works outside the docker:
-- In HIL-SERL's FrankaEnv, robot/gripper are controlled via a Flask server.
-  The env calls HTTP endpoints like /pose, /open_gripper, /close_gripper,
-  /jointreset, /getstate.
-- This script uses the same HTTP endpoints for scripted segments, and uses
-  env.step() for the policy rollout.
-"""
 
 import os
 import time
 import datetime
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, Sequence, Dict, Any, Tuple
 
@@ -109,41 +96,21 @@ def quat_angle(q1, q2):
     d = max(-1.0, min(1.0, d))
     return 2.0 * np.arccos(d)  # rad
 
-def wait_until_pose(robot, goal_pose7, *,
-                    pos_tol=0.0005,
-                    ori_tol_deg=0.5,
-                    vel_tol=0.05,           # rad/s (optional)
-                    timeout_s=10.0,
-                    poll_dt=0.02):
-    goal_pose7 = np.asarray(goal_pose7, float).reshape(7)
-    ori_tol = np.deg2rad(ori_tol_deg)
-
-    t0 = time.time()
-    while time.time() - t0 < timeout_s:
-        st = robot.get_state()
-        curr = np.asarray(st["pose"], float).reshape(7)
-
-        pos_err = np.linalg.norm(curr[:3] - goal_pose7[:3])
-        ori_err = quat_angle(curr[3:], goal_pose7[3:])
-
-        ok = (pos_err < pos_tol) and (ori_err < ori_tol)
-
-        # If dq is available, also require "settled" velocity
-        if ok and ("dq" in st):
-            dq = np.asarray(st["dq"], float).reshape(-1)
-            ok = ok and (np.max(np.abs(dq)) < vel_tol)
-
-        if ok:
-            return True
-
-        time.sleep(poll_dt)
-    return False
-
+def wait_for_file(path: str, poll_s: float = 0.05):
+    p = Path(path)
+    # don't accidentally auto-start due to a stale file
+    if p.exists():
+        p.unlink()
+    print(f"[eval] Ready. Waiting for: {path}", flush=True)
+    while not p.exists():
+        time.sleep(poll_s)
+    print("[eval] Start signal received.", flush=True)
+    
 @dataclass
 class FlaskRobotClient:
     server_url: str
     hz: float = 10.0
-    timeout_s: float = 5.0
+    timeout_s: float = 10.0
 
     def _post(self, endpoint: str, json: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = self.server_url.rstrip("/") + "/" + endpoint.lstrip("/")
@@ -157,6 +124,12 @@ class FlaskRobotClient:
     def clear_error(self):
         self._post("clearerr")
 
+    def start_imp(self):
+        self._post("startimp")
+
+    def stop_imp(self):
+        self._post("stopimp")
+
     def get_state(self) -> Dict[str, Any]:
         return self._post("getstate")
 
@@ -168,24 +141,20 @@ class FlaskRobotClient:
     def gripper_open(self):
         self._post("open_gripper")
 
-    def RGI_open(self):
-        self._post("open_rgi")
-
     def gripper_close(self):
         self._post("close_gripper")
 
     def joint_reset(self):
         self._post("jointreset")
 
-    def moveL(self, goal_pose, duration=1.0, hz=10.0,
-          pos_tol=0.0005, ori_tol_deg=0.5, settle_timeout_s=20.0):
+    def moveL(self, goal_pose: np.ndarray, timeout: Optional[float] = None):
         """Linear-interp Cartesian motion by repeatedly calling /pose at hz.
 
         goal_pose: (6,) xyz+rpy(rad) OR (7,) xyz+quat(xyzw)
         """
-        duration = float(duration) if duration is not None else 1.0
+        timeout = float(timeout) if timeout is not None else 1.0
         hz = float(self.hz) if self.hz > 0 else 10.0
-        steps = max(1, int(round(duration * hz)))
+        steps = max(1, int(round(timeout * hz)))
 
         st = self.get_state()
         curr = np.asarray(st["pose"], dtype=np.float64).reshape(7)
@@ -196,82 +165,6 @@ class FlaskRobotClient:
         for p in path:
             self.send_pose7(p)
             time.sleep(1.0 / hz)
-
-        ok = wait_until_pose(self, goal_pose,
-                         pos_tol=pos_tol, ori_tol_deg=ori_tol_deg,
-                         timeout_s=settle_timeout_s)
-        if not ok:
-            print("[moveL] warning: timeout waiting for pose convergence")
-
-    def moveJ(self, q: Optional[Sequence[float]] = None, timeout: Optional[float] = None):
-        """Joint-space move.
-
-        - If q is None: calls /jointreset (built-in in your server).
-        - If q is provided: calls /movej with {"q": [7 joints], "timeout_s": ...}.
-
-        Requires the Flask server to expose POST /movej.
-        """
-        if q is None:
-            self.joint_reset()
-            time.sleep(0.5)
-            return
-
-        q_list = np.asarray(q, dtype=np.float64).reshape(-1).tolist()
-        if len(q_list) != 7:
-            raise ValueError(f"moveJ expects 7 joints (rad), got {len(q_list)}")
-
-        payload = {"q": q_list}
-        if timeout is not None:
-            payload["timeout_s"] = float(timeout)
-
-        out = self._post("movej", json=payload)
-        if not isinstance(out, dict):
-            raise RuntimeError(f"/movej returned non-JSON: {out}")
-
-        if out.get("success") is True:
-            return
-
-        raise RuntimeError(f"moveJ failed: {out}")
-
-def scripted_pickup(robot: FlaskRobotClient):
-    """Example pickup routine (poses must be provided via flags)."""
-    pick = np.array([0.5502254928632084,0.40315765836094797,0.23516137877127272,0.7225989404526042,0.6912205636900535,0.004304454004383691,0.0068099386563031435])
-    prepick = pick
-    prepick[2] += 0.1
-    pick_home = np.array([0.3892901479199218,0.50033702367876,0.346014485119595,0.7012299730869341,0.7127140801584075,0.01771506619668636,0.0011581097097977959])
-    episode_home = np.array([0.13514075836778805, 0.5500716440949072, 0.13716668456036641, np.pi, 0, 0])
-    episode_start = episode_home
-    episode_start[2] += 0.15
-
-    print_green("[script] pickup: open gripper")
-    robot.gripper_open()
-    time.sleep(0.1)
-
-    print_green("[script] pickup: moveL picking-home")
-    robot.moveL(pick_home, duration=8)
-
-    print_green("[script] pickup: moveL prepick")
-    robot.moveL(prepick, duration=8)
-
-    print_green("[script] pickup: moveL pick")
-    robot.moveL(pick, duration=3)
-
-    print_green("[script] pickup: close gripper")
-    robot.gripper_close()
-    time.sleep(0.2)
-
-    print_green("[script] pickup: open RGI gripper")
-    robot.RGI_open()
-    time.sleep(0.2)
-
-    print_green("[script] pickup: moveL prepick")
-    robot.moveL(prepick, duration=3)
-
-    print_green("[script] pickup: moveL eposide_start")
-    robot.moveL(episode_start, duration=10)
-
-    print_green("[script] pickup: moveL eposide_home")
-    robot.moveL(episode_home, duration=3)
 
 def scripted_post_episode(robot: FlaskRobotClient):
     """Example post-episode routine: (optional) move -> open -> (optional) move -> joint reset."""
@@ -317,12 +210,6 @@ def evaluate(agent, env, rng, robot: FlaskRobotClient):
         done = False
         truncated = False
         t0 = time.time()
-
-        # Scripted "setup" (pickup) BEFORE the policy loop.
-        if FLAGS.do_pickup:
-            scripted_pickup(robot)
-            break
-            # ensure the env sees fresh state if it caches (FrankaEnv queries /getstate in step anyway)
 
         step_in_ep = 0
         last_info: Dict[str, Any] = {}
@@ -375,7 +262,6 @@ def main(_):
     base_env = getattr(env, "unwrapped", env)
     server_url = FLAGS.server_url_override.strip() or getattr(base_env, "url", "http://127.0.0.1:5000/")
     hz = float(FLAGS.script_hz) if FLAGS.script_hz > 0 else float(getattr(base_env, "hz", 10.0))
-    robot = FlaskRobotClient(server_url=server_url, hz=hz)
 
     # Build agent
     if config.setup_mode in ("single-arm-fixed-gripper", "dual-arm-fixed-gripper"):
@@ -415,8 +301,15 @@ def main(_):
     agent = jax.device_put(jax.tree_map(jnp.array, agent), sharding.replicate())
     sampling_rng = jax.device_put(sampling_rng, sharding.replicate())
 
-    print_green("starting evaluation (scripted + policy)")
+    robot = FlaskRobotClient(server_url=server_url, hz=hz)
     print_green(f"Flask server: {robot.server_url}")
+    print_green("stop impedance for host controller")
+    robot.stop_imp()
+
+    wait_for_file("/tmp/start_eval")
+    
+    print_green("start impedance and evaluate")
+    robot.start_imp()
     evaluate(agent, env, sampling_rng, robot)
 
 

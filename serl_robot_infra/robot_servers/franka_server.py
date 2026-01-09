@@ -32,7 +32,7 @@ flags.DEFINE_string(
 )
 flags.DEFINE_list(
     "reset_joint_target",
-    [1.5959619886,0.1452558658,-0.2614405266,-2.0465805071,0.0455929640,2.1850543402,1.3107662306],
+    [0.679101040,0.242576141,0.262277463,-1.571893857,-0.063715853,1.802497086,-0.620910871],
     "Target joint angles for the robot to reset to",
 )
 flags.DEFINE_string("flask_url", 
@@ -298,7 +298,7 @@ def main(_):
     elif GRIPPER_TYPE == "DH":
         from robot_servers.dh_gripper_server import DHGripperServer
         gripper_server = DHGripperServer(gripper_port=GRIPPER_IP)
-        RGI_gripper_server = DHGripperServer(gripper_port="/dev/ttyUSB2")
+        # RGI_gripper_server = DHGripperServer(gripper_port="/dev/ttyUSB2")
     elif GRIPPER_TYPE == "Franka":
         from robot_servers.franka_gripper_server import FrankaGripperServer
 
@@ -479,11 +479,11 @@ def main(_):
         gripper_server.open()
         return "Opened"
     
-    @webapp.route("/open_rgi", methods=["POST"])
-    def open_rgi():
-        print("open rgi")
-        RGI_gripper_server.open()
-        return "RGI Opened"
+    # @webapp.route("/open_rgi", methods=["POST"])
+    # def open_rgi():
+    #     print("open rgi")
+    #     RGI_gripper_server.open()
+    #     return "RGI Opened"
 
     @webapp.route("/right_grasp", methods=["POST"])
     def right_grasp():

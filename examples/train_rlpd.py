@@ -13,6 +13,7 @@ import copy
 import pickle as pkl
 from gymnasium.wrappers.record_episode_statistics import RecordEpisodeStatistics
 from natsort import natsorted
+from pynput import keyboard
 
 from serl_launcher.agents.continuous.sac import SACAgent
 from serl_launcher.agents.continuous.sac_hybrid_single import SACAgentHybridSingleArm
@@ -51,10 +52,155 @@ flags.DEFINE_boolean(
     "debug", False, "Debug mode."
 )  # debug mode will disable wandb logging
 
+jax.config.update("jax_enable_compilation_cache", True)
+jax.config.update("jax_compilation_cache_dir", "/home/terry/tmp/jax_cache")
+jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+print(f"JAX cache dir: {jax.config.values['jax_compilation_cache_dir']}")
+print(f"JAX cache enabled: {jax.config.values.get('jax_enable_compilation_cache', 'Not set')}")
 
 devices = jax.local_devices()
 num_devices = len(devices)
 sharding = jax.sharding.PositionalSharding(devices)
+
+# ---------------- Actor keyboard controls ----------------
+# These only affect the ACTOR loop.
+#   o/c : open/close gripper immediately
+#   p   : pause/resume env stepping (use while manually adjusting peg)
+#   r   : drop current episode buffer and reset env immediately
+#   q   : quit actor loop gracefully
+#   (after episode ends) k = keep episode, x = drop episode
+KEY_OPEN_GRIPPER = 'o'
+KEY_CLOSE_GRIPPER = 'c'
+KEY_TOGGLE_PAUSE = 'p'
+KEY_RESET = 'r'
+KEY_QUIT = 'q'
+KEY_KEEP_EPISODE = 'k'
+KEY_DROP_EPISODE = 'x'
+
+# Shared flags updated by keyboard thread
+_actor_pause = False
+_actor_quit = False
+_actor_reset_req = False
+_actor_gripper_req = None  # 'open' or 'close'
+_actor_episode_decision = None  # 'keep' or 'drop' when waiting for decision
+
+
+def _as_char(key):
+    try:
+        return key.char
+    except Exception:
+        return None
+
+
+def _matches_key(key, target_char: str) -> bool:
+    ch = _as_char(key)
+    return ch == target_char
+
+
+def _unwrap_env(env):
+    """Walk through gymnasium wrappers to reach the base env."""
+    visited = set()
+    cur = env
+    for _ in range(50):
+        if cur is None or id(cur) in visited:
+            break
+        visited.add(id(cur))
+        yield cur
+        # gymnasium wrappers expose .env
+        if hasattr(cur, 'env'):
+            nxt = getattr(cur, 'env')
+            if nxt is not None and nxt is not cur:
+                cur = nxt
+                continue
+        # gymnasium has .unwrapped
+        if hasattr(cur, 'unwrapped'):
+            try:
+                nxt = cur.unwrapped
+                if nxt is not None and nxt is not cur:
+                    cur = nxt
+                    continue
+            except Exception:
+                pass
+        break
+
+
+def _get_base_env(env):
+    last = env
+    for e in _unwrap_env(env):
+        last = e
+    return last
+
+
+def _send_gripper(env, open_or_close: str) -> bool:
+    """
+    Prefer FrankaEnv internal helper to keep consistent with its safety gating and gripper_sleep.
+    - open  => env._send_gripper_command(+1.0)
+    - close => env._send_gripper_command(-1.0)
+    Falls back to direct POST if needed.
+    """
+    # Ensure we have fresh curr_gripper_pos for gating
+    if hasattr(env, "_update_currpos"):
+        try:
+            env._update_currpos()
+        except Exception:
+            pass
+
+    if hasattr(env, "_send_gripper_command"):
+        try:
+            env._send_gripper_command(1.0 if open_or_close == "open" else -1.0)
+            return True
+        except Exception:
+            pass
+
+    # Fallback: direct endpoint (no gating)
+    url = getattr(env, "url", None)
+    if isinstance(url, str) and len(url) > 0:
+        import requests
+        try:
+            ep = "open_gripper" if open_or_close == "open" else "close_gripper"
+            requests.post(url + ep)
+            return True
+        except Exception:
+            pass
+
+    return False
+
+
+def _actor_on_press(key):
+    """Keyboard handler for actor loop."""
+    global _actor_pause, _actor_quit, _actor_reset_req
+    global _actor_gripper_req, _actor_episode_decision
+
+    if _matches_key(key, KEY_QUIT):
+        _actor_quit = True
+        return
+
+    if _matches_key(key, KEY_TOGGLE_PAUSE):
+        _actor_pause = not _actor_pause
+        return
+
+    if _matches_key(key, KEY_RESET):
+        _actor_reset_req = True
+        return
+
+    if _matches_key(key, KEY_OPEN_GRIPPER):
+        _actor_gripper_req = 'open'
+        return
+
+    if _matches_key(key, KEY_CLOSE_GRIPPER):
+        _actor_gripper_req = 'close'
+        return
+
+    if _matches_key(key, KEY_KEEP_EPISODE):
+        _actor_episode_decision = 'keep'
+        return
+
+    if _matches_key(key, KEY_DROP_EPISODE):
+        _actor_episode_decision = 'drop'
+        return
+
+# ---------------------------------------------------------
 
 
 def print_green(x):
@@ -143,100 +289,220 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
     done = False
 
     # training loop
+    # NOTE:
+    # We buffer transitions for the current episode locally and ONLY commit them to the learner
+    # after the episode ends and you choose to KEEP it. This is required to support "drop episode".
+    # If you prefer streaming every step (lower latency) you must give up drop-episode ability.
     timer = Timer()
     running_return = 0.0
     already_intervened = False
     intervention_count = 0
     intervention_steps = 0
 
-    pbar = tqdm.tqdm(range(start_step, config.max_steps), dynamic_ncols=True)
-    for step in pbar:
-        timer.tick("total")
+    # actor keyboard listener
+    print_green("\n=== ACTOR CONTROLS ===")
+    print_green("  o/c : open/close gripper immediately")
+    print_green("  p   : pause/resume env stepping (safe while adjusting peg)")
+    print_green("  r   : drop current episode buffer and reset env immediately")
+    print_green("  q   : quit actor loop")
+    print_green("  (after episode ends) k = keep episode, x = drop episode\n")
 
-        with timer.context("sample_actions"):
-            if step < config.random_steps:
-                actions = env.action_space.sample()
-            else:
-                sampling_rng, key = jax.random.split(sampling_rng)
-                actions = agent.sample_actions(
-                    observations=jax.device_put(obs),
-                    seed=key,
-                    argmax=False,
-                )
-                actions = np.asarray(jax.device_get(actions))
+    listener = keyboard.Listener(on_press=_actor_on_press)
+    listener.start()
 
-        # Step environment
-        with timer.context("step_env"):
+    # episode buffers (only committed if you choose KEEP)
+    ep_transitions = []
+    ep_demo_transitions = []
 
-            next_obs, reward, done, truncated, info = env.step(actions)
-            if "left" in info:
-                info.pop("left")
-            if "right" in info:
-                info.pop("right")
+    # progress bar counts environment steps only
+    pbar = tqdm.tqdm(total=config.max_steps, initial=start_step, dynamic_ncols=True)
+    step = start_step
 
-            # override the action with the intervention action
-            if "intervene_action" in info:
-                actions = info.pop("intervene_action")
-                intervention_steps += 1
-                if not already_intervened:
-                    intervention_count += 1
-                already_intervened = True
-            else:
-                already_intervened = False
+    try:
+        while step < config.max_steps:
 
-            running_return += reward
-            transition = dict(
-                observations=obs,
-                actions=actions,
-                next_observations=next_obs,
-                rewards=reward,
-                masks=1.0 - done,
-                dones=done,
-            )
-            if 'grasp_penalty' in info:
-                transition['grasp_penalty']= info['grasp_penalty']
-            data_store.insert(transition)
-            transitions.append(copy.deepcopy(transition))
-            if already_intervened:
-                intvn_data_store.insert(transition)
-                demo_transitions.append(copy.deepcopy(transition))
+            # Always pull latest params (esp. during pauses)
+            client.update()
 
-            obs = next_obs
-            if done or truncated:
-                info["episode"]["intervention_count"] = intervention_count
-                info["episode"]["intervention_steps"] = intervention_steps
-                stats = {"environment": info}  # send stats to the learner to log
-                client.request("send-stats", stats)
-                pbar.set_description(f"last return: {running_return}")
+            # Quit
+            if _actor_quit:
+                print_green("[actor] quit requested; exiting.")
+                break
+
+            # Apply gripper command if requested (works even when paused)
+            if _actor_gripper_req is not None:
+                req = _actor_gripper_req
+                # clear the request early to avoid repeats
+                globals()['_actor_gripper_req'] = None
+                ok = _send_gripper(env, req)
+                if not ok:
+                    print("[warn] gripper command failed (no method/endpoint reachable).")
+
+            # Reset request: drop current episode and reset immediately
+            if _actor_reset_req:
+                globals()['_actor_reset_req'] = False
+                ep_transitions = []
+                ep_demo_transitions = []
                 running_return = 0.0
                 intervention_count = 0
                 intervention_steps = 0
                 already_intervened = False
-                client.update()
                 obs, _ = env.reset()
+                continue
 
-        if step > 0 and config.buffer_period > 0 and step % config.buffer_period == 0:
-            # dump to pickle file
+            # Pause: do not step env (do not send pose commands)
+            if _actor_pause:
+                time.sleep(0.05)
+                # update the progress bar description while paused
+                pbar.set_description(f"paused | last return={running_return:.2f}")
+                continue
+            
+            timer.tick("total")
+            with timer.context("sample_actions"):
+                if step < config.random_steps:
+                    actions = env.action_space.sample()
+                else:
+                    sampling_rng, key = jax.random.split(sampling_rng)
+                    actions = agent.sample_actions(
+                        observations=jax.device_put(obs),
+                        seed=key,
+                        argmax=False,
+                    )
+                    actions = np.asarray(jax.device_get(actions))
+
+            # Step environment
+            with timer.context("step_env"):
+                next_obs, reward, done, truncated, info = env.step(actions)
+                if "left" in info:
+                    info.pop("left")
+                if "right" in info:
+                    info.pop("right")
+
+                # override the action with the intervention action
+                if "intervene_action" in info:
+                    actions = info.pop("intervene_action")
+                    intervention_steps += 1
+                    if not already_intervened:
+                        intervention_count += 1
+                    already_intervened = True
+                else:
+                    already_intervened = False
+
+                running_return += reward
+
+                transition = dict(
+                    observations=obs,
+                    actions=actions,
+                    next_observations=next_obs,
+                    rewards=reward,
+                    masks=1.0 - done,
+                    dones=done,
+                )
+                if 'grasp_penalty' in info:
+                    transition['grasp_penalty'] = info['grasp_penalty']
+
+                ep_transitions.append(copy.deepcopy(transition))
+                if already_intervened:
+                    ep_demo_transitions.append(copy.deepcopy(transition))
+
+                obs = next_obs
+                step += 1
+                pbar.update(1)
+
+                # Episode end: ask keep/drop
+                if done or truncated:
+                    # add intervention stats to RecordEpisodeStatistics payload if present
+                    if isinstance(info, dict) and "episode" in info and isinstance(info["episode"], dict):
+                        info["episode"]["intervention_count"] = intervention_count
+                        info["episode"]["intervention_steps"] = intervention_steps
+
+                    # Show summary and wait for decision
+                    globals()['_actor_episode_decision'] = None
+                    print_green("\n[episode ended]")
+                    print_green(f"  return={running_return:.3f}  steps={len(ep_transitions)}  intervened_eps={intervention_count}  intervene_steps={intervention_steps}")
+                    print_green("  press 'k' to KEEP episode, 'x' to DROP episode (you can also press 'r' to reset).\n")
+
+                    # Wait for decision (you can still open/close gripper while waiting)
+                    while globals().get('_actor_episode_decision', None) is None and (not globals().get('_actor_quit', False)):
+                        # handle gripper during decision wait
+                        if globals().get('_actor_gripper_req', None) is not None:
+                            req = globals()['_actor_gripper_req']
+                            globals()['_actor_gripper_req'] = None
+                            _send_gripper(env, req)
+                        if globals().get('_actor_reset_req', False):
+                            globals()['_actor_reset_req'] = False
+                            globals()['_actor_episode_decision'] = 'drop'
+                            break
+                        time.sleep(0.05)
+
+                    if _actor_quit:
+                        break
+
+                    decision = globals().get('_actor_episode_decision', 'keep')
+                    kept = (decision == 'keep')
+
+                    if kept and len(ep_transitions) > 0:
+                        # commit episode transitions to learner
+                        for t in ep_transitions:
+                            data_store.insert(t)
+                            transitions.append(copy.deepcopy(t))
+                        for t in ep_demo_transitions:
+                            intvn_data_store.insert(t)
+                            demo_transitions.append(copy.deepcopy(t))
+
+                        # send stats to learner for logging ONLY if kept
+                        stats = {"environment": info}
+                        client.request("send-stats", stats)
+                        pbar.set_description(f"kept | last return: {running_return:.2f}")
+                    else:
+                        pbar.set_description(f"dropped | last return: {running_return:.2f}")
+
+                    # reset for next episode
+                    running_return = 0.0
+                    intervention_count = 0
+                    intervention_steps = 0
+                    already_intervened = False
+                    ep_transitions = []
+                    ep_demo_transitions = []
+                    obs, _ = env.reset()
+                # client.request("send-stats", stats)
+
+            # periodic buffer dump (only includes KEPT episodes)
+            if step > 0 and config.buffer_period > 0 and step % config.buffer_period == 0:
+                buffer_path = os.path.join(FLAGS.checkpoint_path, "buffer")
+                demo_buffer_path = os.path.join(FLAGS.checkpoint_path, "demo_buffer")
+                os.makedirs(buffer_path, exist_ok=True)
+                os.makedirs(demo_buffer_path, exist_ok=True)
+                with open(os.path.join(buffer_path, f"transitions_{step}.pkl"), "wb") as f:
+                    pkl.dump(transitions, f)
+                    transitions = []
+                with open(os.path.join(demo_buffer_path, f"transitions_{step}.pkl"), "wb") as f:
+                    pkl.dump(demo_transitions, f)
+                    demo_transitions = []
+            
+            timer.tock("total")
+    finally:
+        # final dump on exit (only if there are pending kept episodes not yet dumped)
+        if FLAGS.checkpoint_path is not None and step > 0 and config.buffer_period > 0 and (step % config.buffer_period) != 0:
             buffer_path = os.path.join(FLAGS.checkpoint_path, "buffer")
             demo_buffer_path = os.path.join(FLAGS.checkpoint_path, "demo_buffer")
-            if not os.path.exists(buffer_path):
-                os.makedirs(buffer_path)
-            if not os.path.exists(demo_buffer_path):
-                os.makedirs(demo_buffer_path)
-            with open(os.path.join(buffer_path, f"transitions_{step}.pkl"), "wb") as f:
-                pkl.dump(transitions, f)
-                transitions = []
-            with open(
-                os.path.join(demo_buffer_path, f"transitions_{step}.pkl"), "wb"
-            ) as f:
-                pkl.dump(demo_transitions, f)
-                demo_transitions = []
+            os.makedirs(buffer_path, exist_ok=True)
+            os.makedirs(demo_buffer_path, exist_ok=True)
+            if len(transitions) > 0:
+                with open(os.path.join(buffer_path, f"transitions_{step}.pkl"), "wb") as f:
+                    pkl.dump(transitions, f)
+            if len(demo_transitions) > 0:
+                with open(os.path.join(demo_buffer_path, f"transitions_{step}.pkl"), "wb") as f:
+                    pkl.dump(demo_transitions, f)
 
-        timer.tock("total")
-
-        if step % config.log_period == 0:
-            stats = {"timer": timer.get_average_times()}
-            client.request("send-stats", stats)
+        try:
+            listener.stop()
+        except Exception:
+            pass
+        try:
+            pbar.close()
+        except Exception:
+            pass
 
 
 ##############################################################################

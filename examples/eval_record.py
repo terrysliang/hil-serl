@@ -51,7 +51,7 @@ flags.DEFINE_string(
 )
 flags.DEFINE_list(
     "eval_camera_keys",
-    ["wrist_1", "side_1"],
+    ["wrist_1", "wrist_2"],
     "Camera keys to keep under obs['images']. Use [] to keep all.",
 )
 flags.DEFINE_boolean(
@@ -182,7 +182,7 @@ def eval_and_record(agent, env, rng):
             rng, key = jax.random.split(rng)
             actions = agent.sample_actions(
                 observations=jax.device_put(obs),
-                argmax=False,
+                argmax=False, #TODO
                 seed=key,
             )
             actions = np.asarray(jax.device_get(actions))

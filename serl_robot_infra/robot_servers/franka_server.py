@@ -88,7 +88,7 @@ class FrankaServer:
             ],
             stdout=subprocess.PIPE,
         )
-        time.sleep(3)
+        time.sleep(0.5)
 
     def stop_impedance(self):
         """Stops the impedance controller"""

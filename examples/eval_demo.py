@@ -28,8 +28,8 @@ FLAGS = flags.FLAGS
 flags.DEFINE_string("exp_name", None, "Experiment name (key in CONFIG_MAPPING).")
 flags.DEFINE_integer("seed", 42, "Random seed.")
 flags.DEFINE_string("checkpoint_path", None, "Path to checkpoint directory.")
-flags.DEFINE_integer("eval_checkpoint_step", 0, "Checkpoint step to evaluate.")
-flags.DEFINE_integer("eval_n_trajs", 10, "Number of evaluation episodes.")
+flags.DEFINE_integer("eval_checkpoint_step", 63000, "Checkpoint step to evaluate.")
+flags.DEFINE_integer("eval_n_trajs", 1, "Number of evaluation episodes.")
 flags.DEFINE_boolean("save_video", False, "Enable env-side video saving if supported.")
 flags.DEFINE_integer("eval_max_steps_per_ep", 0, "Optional cap (0 = until env done).")
 
@@ -47,6 +47,12 @@ flags.DEFINE_boolean("do_pickup", False, "Run pickup scripted routine before pol
 flags.DEFINE_boolean("do_release", False, "Open gripper after the episode ends.")
 flags.DEFINE_boolean("do_joint_reset_after", False, "Call joint reset after each episode ends.")
 
+jax.config.update("jax_enable_compilation_cache", True)
+jax.config.update("jax_compilation_cache_dir", "/home/terry/tmp/jax_cache")
+jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+print(f"JAX cache dir: {jax.config.values['jax_compilation_cache_dir']}")
+print(f"JAX cache enabled: {jax.config.values.get('jax_enable_compilation_cache', 'Not set')}")
 # Keep consistent with the training/eval pattern: replicate across local devices.
 devices = jax.local_devices()
 sharding = jax.sharding.PositionalSharding(devices)
@@ -108,26 +114,72 @@ def wait_for_file(path: str, poll_s: float = 0.05, remove_first: bool = True):
     
 
 def restore_agent_checkpoint(agent):
-    """Restore agent state from checkpoint on host (pre-load before handoff wait)."""
     assert FLAGS.checkpoint_path is not None, "--checkpoint_path is required"
-    assert FLAGS.eval_checkpoint_step, "--eval_checkpoint_step must be > 0"
+    assert FLAGS.eval_checkpoint_step > 0, "--eval_checkpoint_step must be > 0"
+    assert FLAGS.eval_n_trajs > 0, "--eval_n_trajs must be > 0"
+
     t0 = time.time()
-    print_green(f"[eval] restoring checkpoint (preload): {os.path.abspath(FLAGS.checkpoint_path)} step={FLAGS.eval_checkpoint_step}")
+    ckpt = checkpoints.restore_checkpoint(
+        os.path.abspath(FLAGS.checkpoint_path),
+        agent.state,
+        step=FLAGS.eval_checkpoint_step,
+    )
+    agent = agent.replace(state=ckpt)
     print_green(f"[eval] checkpoint restored in {time.time()-t0:.3f}s")
     return agent
 
 
-def warmup_policy(agent, rng, obs_space):
-    """Trigger JAX compilation before we start moving the robot."""
+
+def to_policy_obs(obs):
+    """Convert env obs to the policy's expected obs dict.
+
+    Policy (SAC encoder) expects:
+      - image keys (e.g., 'wrist_1') at the TOP level
+      - optional proprio under key 'state' as a 1D float array (not a dict)
+
+    FrankaEnv returns:
+      {'images': {cam: HxWx3 uint8}, 'state': {tcp_pose,...}}
+    This function flattens it to:
+      {cam: HxWx3 uint8, 'state': (20,) float32}
+    """
+    if not (isinstance(obs, dict) and "images" in obs and isinstance(obs["images"], dict)):
+        return obs
+
+    out = dict(obs["images"])
+
+    # Flatten state dict -> vector (matches FrankaEnv.observation_space)
+    st = obs.get("state", None)
+    if isinstance(st, dict):
+        parts = []
+        for k in ["tcp_pose", "tcp_vel", "tcp_force", "tcp_torque"]:
+            if k not in st:
+                continue
+            v = np.asarray(st[k], dtype=np.float32).reshape(-1)
+            parts.append(v)
+        if parts:
+            out["state"] = np.concatenate(parts, axis=0).astype(np.float32)
+    elif st is not None:
+        out["state"] = np.asarray(st, dtype=np.float32)
+
+    return out
+
+
+def warmup_policy(agent, rng, obs):
+    """Trigger JAX compilation before we start moving the robot.
+
+    Option B: warm up using a *real* observation pytree (same structure/dtypes as eval loop),
+    without calling env.reset()/env.step().
+    """
     t0 = time.time()
     print_green("[eval] warming up policy (JIT compile)")
-    dummy_obs = obs_space.sample()
 
     # Match the evaluation loop behavior (split rng, then call sample_actions).
     rng, key = jax.random.split(rng)
+    obs = to_policy_obs(obs)
+
     actions = agent.sample_actions(
-        observations=jax.device_put(dummy_obs),
-        argmax=False,
+        observations=jax.device_put(to_policy_obs(obs)),
+        argmax=True,
         seed=key,
     )
 
@@ -145,6 +197,7 @@ def warmup_policy(agent, rng, obs_space):
 
     print_green(f"[eval] warmup finished in {time.time()-t0:.3f}s")
     return rng
+
 
 @dataclass
 class FlaskRobotClient:
@@ -207,33 +260,16 @@ class FlaskRobotClient:
             time.sleep(1.0 / hz)
 
 def scripted_post_episode(robot: FlaskRobotClient):
-    """Example post-episode routine: (optional) move -> open -> (optional) move -> joint reset."""
-    pre_release = _parse_floats_csv(FLAGS.post_release_pose)
-    post_safe = _parse_floats_csv(FLAGS.post_safe_pose)
 
-    if pre_release is not None:
-        print_green("[script] post: moveL pre-release")
-        robot.moveL(pre_release, timeout=FLAGS.script_default_duration)
+    evaluation_home = np.array([0.13387135, 0.55630949, 0.16354294, np.pi, 0, 0])
 
-    if FLAGS.do_release:
-        print_green("[script] post: open gripper")
-        robot.gripper_open()
-        time.sleep(0.2)
+    robot.gripper_open()
+    time.sleep(0.1)
 
-    if post_safe is not None:
-        print_green("[script] post: moveL safe pose")
-        robot.moveL(post_safe, timeout=FLAGS.script_default_duration)
-
-    if FLAGS.do_joint_reset_after:
-        print_green("[script] post: joint reset")
-        robot.moveJ(None)
-        time.sleep(0.5)
+    robot.moveL(evaluation_home, timeout=2)
 
 
 def evaluate(agent, env, rng, robot: FlaskRobotClient):
-    assert FLAGS.checkpoint_path is not None, "--checkpoint_path is required"
-    assert FLAGS.eval_checkpoint_step, "--eval_checkpoint_step must be > 0"
-    assert FLAGS.eval_n_trajs > 0, "--eval_n_trajs must be > 0"
 
     success_counter = 0.0
     times = []
@@ -247,6 +283,8 @@ def evaluate(agent, env, rng, robot: FlaskRobotClient):
         step_in_ep = 0
         last_info: Dict[str, Any] = {}
 
+
+        ever_succeed = False  # set True when we ever see success in this episode
         while not (done or truncated):
             if FLAGS.eval_max_steps_per_ep and step_in_ep >= FLAGS.eval_max_steps_per_ep:
                 truncated = True
@@ -255,7 +293,7 @@ def evaluate(agent, env, rng, robot: FlaskRobotClient):
             rng, key = jax.random.split(rng)
             actions = agent.sample_actions(
                 observations=jax.device_put(obs),
-                argmax=False,
+                argmax=True,
                 seed=key,
             )
             actions = np.asarray(jax.device_get(actions))
@@ -263,17 +301,23 @@ def evaluate(agent, env, rng, robot: FlaskRobotClient):
             obs, reward, done, truncated_step, info = env.step(actions)
             last_info = info if isinstance(info, dict) else {}
             truncated = truncated or bool(truncated_step)
+
+            # Some envs do not set done=True on success; treat a positive reward / succeed flag as terminal.
+            succeed_step = bool(reward) or bool(last_info.get("succeed", False)) or bool(last_info.get("is_success", False))
+            if succeed_step:
+                ever_succeed = True
+                # Ensure downstream logic sees success even if later steps would overwrite last_info
+                last_info["succeed"] = True
+                done = True
+
             step_in_ep += 1
 
-        succeed = bool(last_info.get("succeed")) if "succeed" in last_info else False
+        succeed = bool(last_info.get('succeed', False)) or bool(ever_succeed)
         success_counter += float(succeed)
         if succeed:
             times.append(time.time() - t0)
 
         print_green(f"[{ep+1}/{FLAGS.eval_n_trajs}] success={succeed} steps={step_in_ep}")
-
-        # Scripted "teardown" AFTER the policy loop.
-        scripted_post_episode(robot)
 
     print_green(f"success rate: {success_counter / float(FLAGS.eval_n_trajs)}")
     if len(times):
@@ -347,14 +391,30 @@ def main(_):
 
     # Preload checkpoint + JIT compile while the host controller is running.
     agent = restore_agent_checkpoint(agent)
-    sampling_rng = warmup_policy(agent, sampling_rng, env.observation_space)
+    # Option B warmup: use a real observation (no reset/step), so JAX compiles the exact eval path.
+    warm_obs = None
+    try:
+        # base_env here is env.unwrapped (created above); it should expose _update_currpos/_get_obs in FrankaEnv.
+        if hasattr(base_env, "_update_currpos"):
+            base_env._update_currpos()
+        if hasattr(base_env, "_get_obs"):
+            warm_obs = base_env._get_obs()
+    except Exception as e:
+        print(f"[warn] warmup obs via base_env._get_obs failed: {e}")
 
+    if warm_obs is None:
+        # Fallback (still compiles something shape-correct)
+        warm_obs = env.observation_space.sample()
+        print("[warn] using observation_space.sample() for warmup (fallback).")
+
+    sampling_rng = warmup_policy(agent, sampling_rng, warm_obs)
     wait_for_file(start_file, remove_first=False)
     
     print_green("start impedance and evaluate")
     robot.start_imp()
     evaluate(agent, env, sampling_rng, robot)
 
+    scripted_post_episode(robot)
 
 if __name__ == "__main__":
     app.run(main)

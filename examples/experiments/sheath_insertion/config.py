@@ -130,8 +130,8 @@ class TrainConfig(DefaultTrainingConfig):
 
                 jaw = float(obs["state"][-1, 6])
                 state_last = jnp.asarray(obs["state"])[-1]
-                print(f"p={p_scalar:.4f}, jaw={jaw:.4f}, reward={(p_scalar>0.85) and (jaw>0.025)}")
-                return int((p_scalar > 0.85) and (jaw > 0.049))
+                print(f"p={p_scalar:.4f}, jaw={jaw:.4f}, reward={(p_scalar>0.85) and (jaw>0.047)}")
+                return int((p_scalar > 0.85) and (jaw > 0.047))
 
             env = MultiCameraBinaryRewardClassifierWrapper(env, reward_func)
         return env

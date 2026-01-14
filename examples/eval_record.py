@@ -65,6 +65,14 @@ flags.DEFINE_integer(
     "Optional cap on steps per evaluation episode (0 = until termination).",
 )
 
+
+jax.config.update("jax_enable_compilation_cache", True)
+jax.config.update("jax_compilation_cache_dir", "/home/terry/tmp/jax_cache")
+jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+print(f"JAX cache dir: {jax.config.values['jax_compilation_cache_dir']}")
+print(f"JAX cache enabled: {jax.config.values.get('jax_enable_compilation_cache', 'Not set')}")
+
 # JAX sharding (keep consistent with training code path)
 devices = jax.local_devices()
 sharding = jax.sharding.PositionalSharding(devices)

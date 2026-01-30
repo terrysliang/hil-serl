@@ -237,6 +237,10 @@ class FlaskRobotClient:
     def gripper_close(self):
         self._post("close_gripper")
 
+    def move_gripper(self, pos: int):
+        pos = int(np.clip(pos, 0, 1000))
+        self._post("move_gripper", json={"gripper_pos": pos})
+
     def joint_reset(self):
         self._post("jointreset")
 
@@ -261,20 +265,33 @@ class FlaskRobotClient:
 
 def scripted_post_episode(robot: FlaskRobotClient):
 
-    evaluation_home = np.array([0.13387135, 0.55630949, 0.16354294, np.pi, 0, 0])
+    home = np.array([0.13387135, 0.55630949, 0.16354294, np.pi, 0, 0], dtype=np.float64)
 
     robot.gripper_open()
     time.sleep(0.1)
 
-    robot.moveL(evaluation_home, timeout=2)
+    st = robot.get_state()
+    curr = np.asarray(st["pose"], dtype=np.float64).reshape(7)
+    target_pose = curr.copy()
+    lift_pose = target_pose.copy()
+    lift_pose[2] += 0.04
 
+    robot.moveL(lift_pose, timeout=1.0)
+    robot.move_gripper(10)
 
-def evaluate(agent, env, rng, robot: FlaskRobotClient):
+    time.sleep(0.1)
+    robot.moveL(target_pose, timeout=1.0)
+    
+    robot.moveL(home, timeout=1.0)
+    robot.gripper_open()
+
+def evaluate(agent, env, rng):
 
     success_counter = 0.0
     times = []
 
     for ep in range(int(FLAGS.eval_n_trajs)):
+        t_imp = time.time()
         obs, _ = env.reset()
         done = False
         truncated = False
@@ -283,8 +300,6 @@ def evaluate(agent, env, rng, robot: FlaskRobotClient):
         step_in_ep = 0
         last_info: Dict[str, Any] = {}
 
-
-        ever_succeed = False  # set True when we ever see success in this episode
         while not (done or truncated):
             if FLAGS.eval_max_steps_per_ep and step_in_ep >= FLAGS.eval_max_steps_per_ep:
                 truncated = True
@@ -298,21 +313,13 @@ def evaluate(agent, env, rng, robot: FlaskRobotClient):
             )
             actions = np.asarray(jax.device_get(actions))
 
+            print_green(f"[timing] warm up time: {time.time() - t_imp:.3f}s")
             obs, reward, done, truncated_step, info = env.step(actions)
             last_info = info if isinstance(info, dict) else {}
             truncated = truncated or bool(truncated_step)
-
-            # Some envs do not set done=True on success; treat a positive reward / succeed flag as terminal.
-            succeed_step = bool(reward) or bool(last_info.get("succeed", False)) or bool(last_info.get("is_success", False))
-            if succeed_step:
-                ever_succeed = True
-                # Ensure downstream logic sees success even if later steps would overwrite last_info
-                last_info["succeed"] = True
-                done = True
-
             step_in_ep += 1
 
-        succeed = bool(last_info.get('succeed', False)) or bool(ever_succeed)
+        succeed = bool(last_info.get("succeed")) if "succeed" in last_info else False
         success_counter += float(succeed)
         if succeed:
             times.append(time.time() - t0)
@@ -411,8 +418,10 @@ def main(_):
     wait_for_file(start_file, remove_first=False)
     
     print_green("start impedance and evaluate")
+    t_imp = time.time()
     robot.start_imp()
-    evaluate(agent, env, sampling_rng, robot)
+    print_green(f"[timing] time for start_imp: {time.time() - t_imp:.3f}s")
+    evaluate(agent, env, sampling_rng)
 
     scripted_post_episode(robot)
 

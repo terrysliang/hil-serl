@@ -88,7 +88,7 @@ class FrankaServer:
             ],
             stdout=subprocess.PIPE,
         )
-        time.sleep(0.5)
+        time.sleep(0.1)
 
     def stop_impedance(self):
         """Stops the impedance controller"""
@@ -515,7 +515,7 @@ def main(_):
     @webapp.route("/move_gripper", methods=["POST"])
     def move_gripper():
         gripper_pos = request.json
-        pos = np.clip(int(gripper_pos["gripper_pos"]), 0, 255)  # 0-255
+        pos = int(gripper_pos["gripper_pos"])  # 0-255
         print(f"move gripper to {pos}")
         gripper_server.move(pos)
         return "Moved Gripper"

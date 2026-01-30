@@ -33,17 +33,24 @@ class EnvConfig(DefaultEnvConfig):
             "exposure": 5000,
             "contrast": 77,
         },
+        "side_1": {
+            "serial_number": "218622274931",
+            "dim": (1280, 720),
+            "exposure": 5000,
+            "contrast": 50,
+        },
     }
     IMAGE_CROP = {
         "wrist_1": lambda img: img[150:550, 490:890],
         "wrist_2": lambda img: img[150:550, 480:880],
+        "side_1": lambda img: img[0:720, 230:950],
     }
     TARGET_POSE = np.array([0.13387135, 0.55630949, 0.11354294, np.pi, 0, 0])
     GRASP_POSE = TARGET_POSE + np.array([0, 0, 0.05, 0, 0, 0])
     RESET_POSE = TARGET_POSE + np.array([0, 0, 0.05, 0, 0, 0])
     # RESET_POSE =  np.array([0.13495839, 0.55607059, 0.16173811, np.pi, 0, 0])
-    ABS_POSE_LIMIT_LOW = TARGET_POSE - np.array([0.05, 0.05, 0.01, 0.3, 0.3, 0.3])
-    ABS_POSE_LIMIT_HIGH = TARGET_POSE + np.array([0.05, 0.05, 0.08, 0.3, 0.3, 0.3])
+    ABS_POSE_LIMIT_LOW = TARGET_POSE - np.array([0.05, 0.05, 0.01, 0.2, 0.1, 0.4])
+    ABS_POSE_LIMIT_HIGH = TARGET_POSE + np.array([0.05, 0.05, 0.08, 0.2, 0.1, 0.4])
     RANDOM_RESET = True
     RANDOM_XY_RANGE = 0.02
     RANDOM_RZ_RANGE = 0.05
@@ -129,8 +136,9 @@ class TrainConfig(DefaultTrainingConfig):
                 p_scalar = float(jnp.ravel(p)[-1])            # <-- scalar python float
 
                 jaw = float(obs["state"][-1, 6])
+                
                 state_last = jnp.asarray(obs["state"])[-1]
-                print(f"p={p_scalar:.4f}, jaw={jaw:.4f}, reward={(p_scalar>0.85) and (jaw>0.047)}")
+                print(f"p={p_scalar:.4f}, jaw={jaw:.4f}, reward={(p_scalar>0.85) and (jaw>0.045)}")
                 return int((p_scalar > 0.85) and (jaw > 0.047))
 
             env = MultiCameraBinaryRewardClassifierWrapper(env, reward_func)

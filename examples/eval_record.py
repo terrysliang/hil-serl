@@ -16,6 +16,13 @@ import time
 import datetime
 import pickle as pkl
 
+
+import sys
+import select
+import termios
+import tty
+import atexit
+import requests
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -54,6 +61,11 @@ flags.DEFINE_list(
     ["wrist_1", "wrist_2"],
     "Camera keys to keep under obs['images']. Use [] to keep all.",
 )
+flags.DEFINE_list(
+    "record_camera_keys",
+    ["wrist_1_full", "wrist_2_full", "side_1"],
+    "Camera keys to keep under obs['images']. Use [] to keep all.",
+)
 flags.DEFINE_boolean(
     "eval_record_infos",
     False,
@@ -82,26 +94,144 @@ def print_green(x: str):
     print("\033[92m {}\033[00m".format(x))
 
 
+# ---------------------------
+# Interactive keyboard controls (TTY only)
+# ---------------------------
+
+def _is_tty():
+    try:
+        return sys.stdin.isatty()
+    except Exception:
+        return False
+
+
+class KeyReader:
+    # Non-blocking single-key reader for terminal (Linux).
+    def __init__(self):
+        self.enabled = _is_tty()
+        self._fd = None
+        self._old = None
+
+    def start(self):
+        if not self.enabled:
+            return
+        self._fd = sys.stdin.fileno()
+        self._old = termios.tcgetattr(self._fd)
+        tty.setcbreak(self._fd)
+        atexit.register(self.stop)
+
+    def stop(self):
+        if not self.enabled:
+            return
+        try:
+            if self._fd is not None and self._old is not None:
+                termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old)
+        except Exception:
+            pass
+        self._fd = None
+        self._old = None
+
+    def get_key(self, timeout_s: float = 0.0):
+        # Return a single character if available, else None.
+        if not self.enabled:
+            return None
+        try:
+            r, _, _ = select.select([sys.stdin], [], [], timeout_s)
+            if r:
+                return sys.stdin.read(1)
+        except Exception:
+            return None
+        return None
+
+
+def _get_base_env(env):
+    base = getattr(env, "unwrapped", env)
+    while hasattr(base, "env") and hasattr(base.env, "unwrapped") and base.env is not base:
+        base = base.env.unwrapped
+    return base
+
+
+def _robot_open(base_env):
+    if hasattr(base_env, "url"):
+        requests.post(base_env.url + "open_gripper")
+        return True
+    return False
+
+
+def _robot_close(base_env):
+    if hasattr(base_env, "url"):
+        requests.post(base_env.url + "close_gripper")
+        return True
+    return False
+
+
+def _print_controls():
+    print_green(
+        """=== EVAL RECORD CONTROLS ===
+   o/c : open/close gripper immediately
+   p   : pause/resume env stepping (safe while adjusting peg)
+   r   : drop current episode buffer and reset env immediately
+   q   : quit evaluation loop
+   (after episode ends) k = keep+save episode, x = drop+redo episode
+"""
+    )
+
 def _to_numpy_pytree(x):
     """Convert nested structures (dict/list/tuple) of arrays/scalars to numpy arrays."""
     return jax.tree_map(lambda y: np.asarray(y), x)
 
 
 def _filter_obs_images(obs_np, camera_keys):
-    """
-    Keep only selected camera keys under obs['images'] to reduce file size.
-    Safe no-op if structure doesn't match.
-    """
     if not camera_keys:
         return obs_np
-    if isinstance(obs_np, dict) and "images" in obs_np and isinstance(obs_np["images"], dict):
+    if not isinstance(obs_np, dict):
+        return obs_np
+
+    # Case A: cameras under obs["images"]
+    if "images" in obs_np and isinstance(obs_np["images"], dict):
         imgs = obs_np["images"]
         missing = [k for k in camera_keys if k not in imgs]
         if missing:
             print_green(f"[eval_record] warning: missing cameras in obs['images']: {missing}")
-        obs_np = dict(obs_np)
-        obs_np["images"] = {k: imgs[k] for k in camera_keys if k in imgs}
-    return obs_np
+        out = dict(obs_np)
+        out["images"] = {k: imgs[k] for k in camera_keys if k in imgs}
+        return out
+
+    # Case B: cameras are top-level keys (obs["wrist_1"], obs["wrist_1_full"], ...)
+    out = dict(obs_np)
+    for k, v in list(out.items()):
+        if k in camera_keys:
+            continue
+        arr = np.asarray(v)
+        if isinstance(arr, np.ndarray) and arr.ndim >= 3:
+            out.pop(k, None)
+    return out
+
+
+def _obs_for_policy(obs, policy_image_keys):
+    """Return an obs that keeps only the cameras used by the policy.
+    Leaves other (non-image) fields intact.
+    """
+    if not policy_image_keys or not isinstance(obs, dict):
+        return obs
+
+    # Case A: cameras are under obs["images"]
+    if "images" in obs and isinstance(obs["images"], dict):
+        out = dict(obs)
+        imgs = obs["images"]
+        out["images"] = {k: imgs[k] for k in policy_image_keys if k in imgs}
+        return out
+
+    # Case B: cameras are top-level keys (e.g., obs["wrist_1"])
+    # Heuristic: drop extra image-like arrays (ndim>=3) that are not in policy_image_keys.
+    out = dict(obs)
+    for k, v in list(out.items()):
+        if k in policy_image_keys:
+            continue
+        ndim = getattr(v, "ndim", None)
+        if ndim is not None and ndim >= 3:
+            out.pop(k, None)
+    return out
 
 
 def _env_rate_info(env):
@@ -118,7 +248,7 @@ def _env_rate_info(env):
     return hz, dt, action_scale
 
 
-def eval_and_record(agent, env, rng):
+def eval_and_record(agent, env, rng, policy_image_keys):
     assert FLAGS.checkpoint_path is not None, "--checkpoint_path is required"
     assert FLAGS.eval_checkpoint_step, "--eval_checkpoint_step must be > 0"
     assert FLAGS.eval_n_trajs > 0, "--eval_n_trajs must be > 0"
@@ -151,7 +281,7 @@ def eval_and_record(agent, env, rng):
         dt=dt,
         action_semantics="delta_pose",
         action_scale=action_scale,
-        camera_keys=list(FLAGS.eval_camera_keys),
+        camera_keys=list(FLAGS.record_camera_keys),
         task=FLAGS.eval_task,
         recorded_at=datetime.datetime.now().isoformat(),
     )
@@ -159,8 +289,20 @@ def eval_and_record(agent, env, rng):
     success_counter = 0.0
     success_times = []
 
-    for episode in range(int(FLAGS.eval_n_trajs)):
-        obs, _ = env.reset()
+    
+    # Interactive controls
+    keyr = KeyReader()
+    keyr.start()
+    _print_controls()
+
+    episode = 0
+    pending_reset = None  # (obs, info) if we already reset manually
+    while episode < int(FLAGS.eval_n_trajs):
+        if pending_reset is None:
+            obs, _ = env.reset()
+        else:
+            obs, _ = pending_reset
+            pending_reset = None
         done = False
         truncated = False
         start_time = time.time()
@@ -182,15 +324,52 @@ def eval_and_record(agent, env, rng):
         step_in_ep = 0
         last_info = {}
 
+        base_env = _get_base_env(env)
+        paused = False
+        redo_episode = False
+        quit_all = False
+
         while not (done or truncated):
+            # Handle keys (non-blocking)
+            ch = keyr.get_key(timeout_s=0.0)
+            if ch:
+                ch = ch.lower()
+                if ch == "p":
+                    paused = not paused
+                    print_green(f"[eval_record] paused={paused}")
+                elif ch == "o":
+                    if _robot_open(base_env):
+                        print_green("[eval_record] gripper_open sent")
+                elif ch == "c":
+                    if _robot_close(base_env):
+                        print_green("[eval_record] gripper_close sent")
+                elif ch == "r":
+                    print_green("[eval_record] dropping current episode + resetting env")
+                    redo_episode = True
+                    break
+                elif ch == "q":
+                    print_green("[eval_record] quitting")
+                    quit_all = True
+                    break
+
+            if quit_all:
+                break
+
+            if paused:
+                time.sleep(0.05)
+                continue
+
             if FLAGS.eval_max_steps_per_ep and step_in_ep >= FLAGS.eval_max_steps_per_ep:
                 truncated = True
                 break
 
             rng, key = jax.random.split(rng)
+
+            policy_obs = _obs_for_policy(obs, policy_image_keys)
+
             actions = agent.sample_actions(
-                observations=jax.device_put(obs),
-                argmax=False, #TODO
+                observations=jax.device_put(policy_obs),
+                argmax=True,
                 seed=key,
             )
             actions = np.asarray(jax.device_get(actions))
@@ -199,8 +378,8 @@ def eval_and_record(agent, env, rng):
             last_info = info
             truncated = truncated or bool(truncated_step)
 
-            obs_np = _filter_obs_images(_to_numpy_pytree(obs), FLAGS.eval_camera_keys)
-            next_obs_np = _filter_obs_images(_to_numpy_pytree(next_obs), FLAGS.eval_camera_keys)
+            obs_np = _filter_obs_images(_to_numpy_pytree(obs), FLAGS.record_camera_keys)
+            next_obs_np = _filter_obs_images(_to_numpy_pytree(next_obs), FLAGS.record_camera_keys)
 
             info_to_store = info
             if isinstance(info_to_store, dict):
@@ -221,7 +400,17 @@ def eval_and_record(agent, env, rng):
             obs = next_obs
             step_in_ep += 1
 
-        ep["final_observation"] = _filter_obs_images(_to_numpy_pytree(obs), FLAGS.eval_camera_keys)
+        if quit_all:
+            break
+
+        if redo_episode:
+            try:
+                pending_reset = env.reset()
+            except Exception:
+                pending_reset = None
+            continue
+
+        ep["final_observation"] = _filter_obs_images(_to_numpy_pytree(obs), FLAGS.record_camera_keys)
         ep["num_steps"] = int(step_in_ep)
 
         succeed = False
@@ -231,6 +420,39 @@ def eval_and_record(agent, env, rng):
             succeed = bool(ep["rewards"][-1])
         ep["success"] = succeed
 
+        print_green(f"[episode ended] success={succeed} steps={step_in_ep}. Press k=keep, x=drop, q=quit.")
+        decision = None
+        while decision is None:
+            ch = keyr.get_key(timeout_s=0.1)
+            if ch:
+                ch = ch.lower()
+                if ch == "k":
+                    decision = "keep"
+                elif ch == "x":
+                    decision = "drop"
+                elif ch == "q":
+                    decision = "quit"
+                elif ch == "o":
+                    if _robot_open(base_env):
+                        print_green("[eval_record] gripper_open sent")
+                elif ch == "c":
+                    if _robot_close(base_env):
+                        print_green("[eval_record] gripper_close sent")
+                elif ch == "r":
+                    decision = "drop"
+
+        if decision == "quit":
+            break
+
+        if decision == "drop":
+            print_green("[eval_record] dropped episode; redoing same index")
+            try:
+                pending_reset = env.reset()
+            except Exception:
+                pending_reset = None
+            continue
+
+        # decision == keep
         if succeed:
             success_times.append(time.time() - start_time)
         success_counter += float(succeed)
@@ -239,7 +461,13 @@ def eval_and_record(agent, env, rng):
         with open(out_path, "wb") as f:
             pkl.dump(ep, f, protocol=pkl.HIGHEST_PROTOCOL)
 
-        print_green(f"[{episode+1}/{FLAGS.eval_n_trajs}] success={succeed} steps={step_in_ep}")
+        print_green(f"[{episode+1}/{FLAGS.eval_n_trajs}] saved. success={succeed} steps={step_in_ep}")
+        episode += 1
+
+    try:
+        keyr.stop()
+    except Exception:
+        pass
 
     print_green(f"saved eval rollouts to: {record_dir}")
     print_green(f"success rate: {success_counter / float(FLAGS.eval_n_trajs)}")
@@ -299,7 +527,7 @@ def main(_):
     sampling_rng = jax.device_put(sampling_rng, sharding.replicate())
 
     print_green("starting evaluation + recording")
-    eval_and_record(agent, env, sampling_rng)
+    eval_and_record(agent, env, sampling_rng, policy_image_keys=list(config.image_keys))
 
 
 if __name__ == "__main__":

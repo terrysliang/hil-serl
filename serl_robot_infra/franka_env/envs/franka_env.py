@@ -11,7 +11,7 @@ import queue
 import threading
 from datetime import datetime
 from collections import OrderedDict
-from typing import Dict
+from typing import Dict, Tuple, Optional
 
 from franka_env.camera.video_capture import VideoCapture
 from franka_env.camera.rs_capture import RSCapture
@@ -50,6 +50,12 @@ class DefaultEnvConfig:
         "wrist_1": "130322274175",
         "wrist_2": "127122270572",
     }
+    # Image sizes are (H, W)
+    OBS_IMAGE_SIZE: Tuple[int, int] = (128, 128)          # what the policy consumes
+    RECORD_IMAGE_SIZE: Optional[Tuple[int, int]] = (256, 256)   # None disables
+    RECORD_IMAGE_SUFFIX: str = "_full"                    # suffix for recorded stream keys
+
+
     IMAGE_CROP: dict[str, callable] = {}
     TARGET_POSE: np.ndarray = np.zeros((6,))
     GRASP_POSE: np.ndarray = np.zeros((6,))
@@ -132,6 +138,22 @@ class FrankaEnv(gym.Env):
             np.ones((7,), dtype=np.float32),
         )
 
+        # Image spaces (policy + optional higher-res recording stream)
+        obs_h, obs_w = self.config.OBS_IMAGE_SIZE
+        img_spaces = {
+            key: gym.spaces.Box(0, 255, shape=(obs_h, obs_w, 3), dtype=np.uint8)
+            for key in config.REALSENSE_CAMERAS
+        }
+        if self.config.RECORD_IMAGE_SIZE is not None:
+            rec_h, rec_w = self.config.RECORD_IMAGE_SIZE
+            suf = self.config.RECORD_IMAGE_SUFFIX
+            img_spaces.update(
+                {
+                    f"{key}{suf}": gym.spaces.Box(0, 255, shape=(rec_h, rec_w, 3), dtype=np.uint8)
+                    for key in config.REALSENSE_CAMERAS
+                }
+            )
+
         self.observation_space = gym.spaces.Dict(
             {
                 "state": gym.spaces.Dict(
@@ -145,10 +167,7 @@ class FrankaEnv(gym.Env):
                         "tcp_torque": gym.spaces.Box(-np.inf, np.inf, shape=(3,)),
                     }
                 ),
-                "images": gym.spaces.Dict(
-                    {key: gym.spaces.Box(0, 255, shape=(128, 128, 3), dtype=np.uint8) 
-                                for key in config.REALSENSE_CAMERAS}
-                ),
+                "images": gym.spaces.Dict(img_spaces),
             }
         )
         self.cycle_count = 0
@@ -252,30 +271,57 @@ class FrankaEnv(gym.Env):
             return False
 
     def get_im(self) -> Dict[str, np.ndarray]:
-        """Get images from the realsense cameras."""
-        images = {}
-        display_images = {}
-        full_res_images = {}  # New dictionary to store full resolution cropped images
+        """Get images from the realsense cameras.
+
+        Returns:
+            images: Dict[str, np.ndarray] where each value is RGB uint8.
+                - Base keys (e.g. wrist_1) are resized to OBS_IMAGE_SIZE for policy consumption.
+                - If RECORD_IMAGE_SIZE is set, extra keys (e.g. wrist_1_full) are added at that size.
+        """
+        images: Dict[str, np.ndarray] = {}
+        display_images: Dict[str, np.ndarray] = {}
+        full_res_images: Dict[str, np.ndarray] = {}  # used for optional video saving
+
+        obs_h, obs_w = self.config.OBS_IMAGE_SIZE
+        obs_wh = (obs_w, obs_h)  # cv2.resize expects (W, H)
+
+        rec_size = self.config.RECORD_IMAGE_SIZE
+        rec_suf = self.config.RECORD_IMAGE_SUFFIX
+        rec_wh = None
+        if rec_size is not None:
+            rec_h, rec_w = rec_size
+            rec_wh = (rec_w, rec_h)
+
+        def _resize(img: np.ndarray, wh: Tuple[int, int]) -> np.ndarray:
+            # If downsampling, INTER_AREA is usually best; otherwise LINEAR is fine.
+            inter = cv2.INTER_AREA if (img.shape[0] > wh[1] or img.shape[1] > wh[0]) else cv2.INTER_LINEAR
+            return cv2.resize(img, wh, interpolation=inter)
+
         for key, cap in self.cap.items():
             try:
-                rgb = cap.read()
-                cropped_rgb = self.config.IMAGE_CROP[key](rgb) if key in self.config.IMAGE_CROP else rgb
-                resized = cv2.resize(
-                    cropped_rgb, self.observation_space["images"][key].shape[:2][::-1]
-                )
-                images[key] = resized[..., ::-1]
+                frame = cap.read()
+                cropped = self.config.IMAGE_CROP[key](frame) if key in self.config.IMAGE_CROP else frame
+
+                # Policy stream
+                resized = _resize(cropped, obs_wh)
+                images[key] = resized[..., ::-1]  # BGR->RGB
+
+                # Optional recording stream (e.g. 256 or 400)
+                if rec_wh is not None:
+                    rec = _resize(cropped, rec_wh)
+                    images[f"{key}{rec_suf}"] = rec[..., ::-1]  # BGR->RGB
+
+                # For live display/debug
                 display_images[key] = resized
-                display_images[key + "_full"] = cropped_rgb
-                full_res_images[key] = copy.deepcopy(cropped_rgb)  # Store the full resolution cropped image
+                display_images[key + "_full"] = cropped  # raw crop for debugging (not shown by ImageDisplayer)
+                full_res_images[key] = copy.deepcopy(cropped)
             except queue.Empty:
-                input(
-                    f"{key} camera frozen. Check connect, then press enter to relaunch..."
-                )
+                input(f"{key} camera frozen. Check connect, then press enter to relaunch...")
                 cap.close()
                 self.init_cameras(self.config.REALSENSE_CAMERAS)
                 return self.get_im()
 
-        # Store full resolution cropped images separately
+        # Store full resolution cropped images separately (legacy video recording path)
         if self.save_video:
             self.recording_frames.append(full_res_images)
 

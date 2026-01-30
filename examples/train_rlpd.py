@@ -233,7 +233,7 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
                 sampling_rng, key = jax.random.split(sampling_rng)
                 actions = agent.sample_actions(
                     observations=jax.device_put(obs),
-                    argmax=False,
+                    argmax=True,
                     seed=key
                 )
                 actions = np.asarray(jax.device_get(actions))
@@ -289,10 +289,6 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
     done = False
 
     # training loop
-    # NOTE:
-    # We buffer transitions for the current episode locally and ONLY commit them to the learner
-    # after the episode ends and you choose to KEEP it. This is required to support "drop episode".
-    # If you prefer streaming every step (lower latency) you must give up drop-episode ability.
     timer = Timer()
     running_return = 0.0
     already_intervened = False
@@ -366,7 +362,7 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
                     actions = agent.sample_actions(
                         observations=jax.device_put(obs),
                         seed=key,
-                        argmax=False,
+                        argmax=True,
                     )
                     actions = np.asarray(jax.device_get(actions))
 

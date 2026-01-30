@@ -107,13 +107,13 @@ class SheathEnv(FrankaEnv):
         if self.save_video:
             self.save_video_recording()
 
-        # if True:
-        if self.should_regrasp:
-            self.regrasp()
-            self.should_regrasp = False
+        # # if True:
+        # if self.should_regrasp:
+        #     self.regrasp()
+        #     self.should_regrasp = False
 
-        self._recover()
-        # self.go_to_reset(joint_reset=False) 
+        # self._recover()
+        self.go_to_reset(joint_reset=False)  
         self._recover()
         self.curr_path_length = 0
 
